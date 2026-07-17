@@ -1,0 +1,23 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package
+      path: solana-storage.proto
+      value: github.com/orbitflare/orbitflare-sdk-go/proto/solanastorage
+    - file_option: go_package
+      path: geyser.proto
+      value: github.com/orbitflare/orbitflare-sdk-go/proto/geyser
+    - file_option: go_package
+      path: jetstream.proto
+      value: github.com/orbitflare/orbitflare-sdk-go/proto/jetstream
+    - file_option: go_package
+      path: jetstream_v2.proto
+      value: github.com/orbitflare/orbitflare-sdk-go/proto/jetstreamv2
+plugins:
+  - local: protoc-gen-go
+    out: .
+    opt: module=github.com/orbitflare/orbitflare-sdk-go
+  - local: protoc-gen-go-grpc
+    out: .
+    opt: module=github.com/orbitflare/orbitflare-sdk-go

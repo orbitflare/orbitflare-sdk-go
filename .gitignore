@@ -1,0 +1,14 @@
+*.exe
+*.test
+*.out
+
+/vendor/
+go.work
+go.work.sum
+
+.env
+.env.local
+
+.DS_Store
+.idea/
+.vscode/
