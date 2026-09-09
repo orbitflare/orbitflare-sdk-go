@@ -140,7 +140,7 @@ func (c *Client) GetTransaction(ctx context.Context, signature string) (json.Raw
 	return c.Request(ctx, "getTransaction", []any{signature, map[string]any{
 		"encoding":                       "json",
 		"commitment":                     c.commitment,
-		"maxSupportedTransactionVersion": 0,
+		"maxSupportedTransactionVersion": 1,
 	}})
 }
 
