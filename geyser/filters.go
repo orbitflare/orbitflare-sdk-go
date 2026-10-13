@@ -412,7 +412,6 @@ func (b *SubscribeRequestBuilder) Build() *pb.SubscribeRequest {
 		BlocksMeta:         blocksMeta,
 		Entry:              entry,
 		AccountsDataSlice:  dataSlice,
-		Ping:               &pb.SubscribeRequestPing{Id: 1},
 		FromSlot:           b.fromSlot,
 	}
 	if b.commitment != nil {
