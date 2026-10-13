@@ -70,8 +70,8 @@ func TestGeyserRequestBuilder(t *testing.T) {
 	if req.GetFromSlot() != 42 {
 		t.Fatalf("from_slot = %d", req.GetFromSlot())
 	}
-	if req.GetPing().GetId() != 1 {
-		t.Fatal("missing initial ping")
+	if req.GetPing() != nil {
+		t.Fatal("initial request carries a ping; vanilla Yellowstone would ignore its filters")
 	}
 	tx := req.GetTransactions()["tx"]
 	if tx.GetVote() || tx.GetSignature() != "sig" || len(tx.GetAccountInclude()) != 2 || len(tx.GetAccountExclude()) != 1 {
