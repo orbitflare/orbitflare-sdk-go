@@ -190,6 +190,7 @@ func (b *Builder) URL(url string) *Builder                 { b.cfg.URL(url); ret
 func (b *Builder) URLs(urls ...string) *Builder            { b.cfg.URLs(urls...); return b }
 func (b *Builder) FallbackURL(url string) *Builder         { b.cfg.FallbackURL(url); return b }
 func (b *Builder) FallbackURLs(urls ...string) *Builder    { b.cfg.FallbackURLs(urls...); return b }
+func (b *Builder) APIKey(key string) *Builder              { b.cfg.APIKey(key); return b }
 func (b *Builder) Retry(p orbitflare.RetryPolicy) *Builder { b.cfg.Retry(p); return b }
 func (b *Builder) Timeout(d time.Duration) *Builder        { b.cfg.Timeout(d); return b }
 func (b *Builder) Keepalive(d time.Duration) *Builder      { b.cfg.Keepalive(d); return b }

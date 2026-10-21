@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"context"
 	"os"
 	"testing"
 )
@@ -63,5 +64,30 @@ func TestConfigBuilderDefaults(t *testing.T) {
 	if b.timeout != DefaultTimeout || b.pingInterval != DefaultPingInterval ||
 		b.maxMissedPongs != DefaultMaxMissedPongs || b.channelCapacity != DefaultChannelCapacity {
 		t.Fatal("unexpected streaming defaults")
+	}
+}
+
+func TestAPIKeyCredentialsSendXToken(t *testing.T) {
+	md, err := apiKeyCredentials("ORBIT-123").GetRequestMetadata(context.Background())
+	if err != nil || md["x-token"] != "ORBIT-123" {
+		t.Fatalf("got %v, %v", md, err)
+	}
+	if apiKeyCredentials("x").RequireTransportSecurity() {
+		t.Fatal("must work over plaintext connections")
+	}
+}
+
+func TestAPIKeyFallsBackToEnv(t *testing.T) {
+	t.Setenv("ORBITFLARE_LICENSE_KEY", "ORBIT-ENV")
+	b := NewConfigBuilder()
+	b.URL("http://localhost:1")
+	cfg, err := b.Build("UNUSED")
+	if err != nil || cfg.APIKey != "ORBIT-ENV" {
+		t.Fatalf("got %q, %v", cfg.APIKey, err)
+	}
+	b.APIKey("ORBIT-EXPLICIT")
+	cfg, _ = b.Build("UNUSED")
+	if cfg.APIKey != "ORBIT-EXPLICIT" {
+		t.Fatalf("explicit key should win, got %q", cfg.APIKey)
 	}
 }

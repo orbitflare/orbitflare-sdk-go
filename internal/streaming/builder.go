@@ -13,6 +13,7 @@ type ConfigBuilder struct {
 	url             string
 	hasURL          bool
 	fallbacks       []string
+	apiKey          string
 	retry           orbitflare.RetryPolicy
 	timeout         time.Duration
 	keepalive       time.Duration
@@ -45,6 +46,7 @@ func (b *ConfigBuilder) URLs(urls ...string) {
 func (b *ConfigBuilder) FallbackURL(url string)      { b.fallbacks = append(b.fallbacks, url) }
 func (b *ConfigBuilder) FallbackURLs(urls ...string) { b.fallbacks = append(b.fallbacks, urls...) }
 
+func (b *ConfigBuilder) APIKey(key string)              { b.apiKey = key }
 func (b *ConfigBuilder) Retry(p orbitflare.RetryPolicy) { b.retry = p }
 func (b *ConfigBuilder) Timeout(d time.Duration)        { b.timeout = d }
 func (b *ConfigBuilder) Keepalive(d time.Duration)      { b.keepalive = d }
@@ -62,8 +64,14 @@ func (b *ConfigBuilder) Build(envVar string) (*Config, error) {
 		return nil, &orbitflare.ConfigError{Message: "no URL provided. Call URL() on the builder or set " + envVar + " in your environment"}
 	}
 
+	apiKey := b.apiKey
+	if apiKey == "" {
+		apiKey = os.Getenv("ORBITFLARE_LICENSE_KEY")
+	}
+
 	return &Config{
 		Endpoints:       endpoint.New(url, b.fallbacks),
+		APIKey:          apiKey,
 		Retry:           b.retry,
 		Timeout:         b.timeout,
 		Keepalive:       b.keepalive,

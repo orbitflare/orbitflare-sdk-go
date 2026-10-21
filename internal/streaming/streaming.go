@@ -37,6 +37,7 @@ type Result[T any] struct {
 
 type Config struct {
 	Endpoints       *endpoint.Set
+	APIKey          string
 	Retry           orbitflare.RetryPolicy
 	Timeout         time.Duration
 	Keepalive       time.Duration
@@ -46,20 +47,32 @@ type Config struct {
 	Logger          *slog.Logger
 }
 
+type apiKeyCredentials string
+
+func (k apiKeyCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"x-token": string(k)}, nil
+}
+
+func (apiKeyCredentials) RequireTransportSecurity() bool { return false }
+
 func (c *Config) Connect(ctx context.Context, rawURL string) (*grpc.ClientConn, error) {
 	target, creds, err := parseTarget(rawURL)
 	if err != nil {
 		return nil, &orbitflare.ConfigError{Message: fmt.Sprintf("invalid endpoint: %v", err)}
 	}
 
-	conn, err := grpc.NewClient(target,
+	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                c.Keepalive,
 			Timeout:             c.Timeout,
 			PermitWithoutStream: true,
 		}),
-	)
+	}
+	if c.APIKey != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(apiKeyCredentials(c.APIKey)))
+	}
+	conn, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, orbitflare.NewTransportError(err)
 	}
