@@ -84,6 +84,48 @@ func main() {
 | `Request(ctx, method, params)` | Any RPC method by name |
 | `RequestRaw(ctx, body)` | Raw JSON-RPC body string |
 
+## DAS API
+
+The Digital Asset Standard methods read NFTs, compressed NFTs, MPL Core assets and SPL tokens. They are on the RPC `Client` and use the same endpoint.
+
+```go
+asset, err := client.GetAsset(ctx, "GJfYbfW7gufzFYfm8gFatrUE71wYsjay6FwzDkTa3vaD", nil)
+fmt.Println(asset.Name(), asset.Owner())
+
+portfolio, err := client.GetAssetsByOwner(ctx, &rpc.GetAssetsByOwnerRequest{
+    OwnerAddress: "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY",
+    Options:      &rpc.DisplayOptions{ShowFungible: true, ShowNativeBalance: true},
+})
+
+tokens, err := client.SearchAssets(ctx, &rpc.SearchAssetsRequest{
+    OwnerAddress: "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY",
+    TokenType:    rpc.TokenTypeFungible,
+    Burnt:        rpc.Ptr(false),
+})
+
+// Every asset in a collection, page by page.
+all, err := client.AssetPages(rpc.AssetsInCollection("CDDyz6MHYY8972DPCXiEeReCxGqJSCbxHnimrvoyWrFF")).All(ctx)
+```
+
+| Method | Returns |
+|---|---|
+| `GetAsset(ctx, id, options)` | `*Asset` |
+| `GetAssetBatch(ctx, ids, options)` | `[]*Asset` in request order, `nil` where not found (auto-chunks to 1,000) |
+| `GetAssetProof(ctx, id)` | `*AssetProof` for a compressed asset |
+| `GetAssetProofBatch(ctx, ids)` | Proofs keyed by asset ID (auto-chunks to 1,000) |
+| `GetAssetWithProof(ctx, id, options)` | Asset and proof in one call, for Bubblegum instructions |
+| `GetAssetsByOwner(ctx, req)` | `*AssetList`, with `NativeBalance` when asked |
+| `GetAssetsByGroup(ctx, req)` | `*AssetList` |
+| `GetAssetsByCreator(ctx, req)` | `*AssetList` |
+| `GetAssetsByAuthority(ctx, req)` | `*AssetList` |
+| `SearchAssets(ctx, req)` | `*AssetList` |
+| `GetTokenAccounts(ctx, req)` | `*TokenAccountList`, by owner, mint or both |
+| `GetNftEditions(ctx, req)` | `*NftEditions` of a master edition |
+| `GetSignaturesForAsset(ctx, req)` | `*AssetSignatures` (signature and instruction pairs) |
+| `AssetPages`, `TokenAccountPages`, `NftEditionPages`, `SignaturePages` | A `Pager` that walks every page: `Next(ctx)` or `All(ctx)` |
+
+`options` may be `nil`. Requests embed `Paging` (`Page`, `Limit`, `Cursor`, `Before`, `After`) and take `SortBy`; use one paging style per request. Pagers copy the request, so it isn't changed. `Asset` has `Name()`, `Symbol()`, `Image()`, `Owner()`, `Collection()` and `IsCompressed()`, and `AssetProof.ProofPath(canopyDepth)` trims the proof for trees with a canopy.
+
 ## gRPC (Yellowstone Geyser)
 
 Build the subscription with the typed filter builder:
@@ -415,7 +457,7 @@ Set `ORBITFLARE_LOG` (`trace|debug|info|warn|error|silent`, default `silent`) fo
 
 ## Examples
 
-Runnable programs live in [`examples/`](examples): `rpc`, `ws`, `geyser`, `jetstream`, and `jetstream_v2`.
+Runnable programs live in [`examples/`](examples): `rpc`, `das`, `ws`, `geyser`, `jetstream`, and `jetstream_v2`.
 
 ```bash
 ORBITFLARE_LICENSE_KEY=ORBIT-... go run ./examples/rpc
