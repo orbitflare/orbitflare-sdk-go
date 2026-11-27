@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"testing"
+
+	"github.com/orbitflare/orbitflare-sdk-go/orbitflare"
 )
 
 func TestParseTargetSchemes(t *testing.T) {
@@ -89,5 +91,28 @@ func TestAPIKeyFallsBackToEnv(t *testing.T) {
 	cfg, _ = b.Build("UNUSED")
 	if cfg.APIKey != "ORBIT-EXPLICIT" {
 		t.Fatalf("explicit key should win, got %q", cfg.APIKey)
+	}
+}
+
+func TestEndpointLabelsHideCredentials(t *testing.T) {
+	cases := map[string]string{
+		"https://user:pw@ams.rpc.orbitflare.com:10000/?api_key=x": "https://ams.rpc.orbitflare.com:10000/",
+		"http://ams.jetstream.orbitflare.com":                     "http://ams.jetstream.orbitflare.com",
+	}
+	for in, want := range cases {
+		if got := EndpointLabel(in); got != want {
+			t.Errorf("EndpointLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPermanentErrors(t *testing.T) {
+	for code, want := range map[int32]bool{3: true, 7: true, 12: true, 16: true, 2: false, 4: false, 8: false, 13: false, 14: false} {
+		if got := IsPermanent(&orbitflare.GRPCError{Code: code}); got != want {
+			t.Errorf("code %d: permanent = %v, want %v", code, got, want)
+		}
+	}
+	if IsPermanent(&orbitflare.StreamError{Message: "x"}) {
+		t.Error("stream errors are not permanent")
 	}
 }

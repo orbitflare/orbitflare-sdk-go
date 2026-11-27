@@ -7,8 +7,9 @@ import (
 	"log/slog"
 	"time"
 
-	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/orbitflare/orbitflare-sdk-go/internal/events"
 	"github.com/orbitflare/orbitflare-sdk-go/internal/streaming"
 	"github.com/orbitflare/orbitflare-sdk-go/orbitflare"
 	pb "github.com/orbitflare/orbitflare-sdk-go/proto/geyser"
@@ -18,6 +19,15 @@ type SubscribeUpdate = pb.SubscribeUpdate
 
 type SubscribeRequest = pb.SubscribeRequest
 
+const replayInfoTimeout = 10 * time.Second
+
+type ConnectInfo struct {
+	Endpoint  string
+	Attempt   uint32
+	Reconnect bool
+	LastSlot  *uint64
+}
+
 type Client struct {
 	cfg    *streaming.Config
 	ctx    context.Context
@@ -26,8 +36,29 @@ type Client struct {
 
 func (c *Client) Close() { c.cancel() }
 
+type Handle struct {
+	cmdCh chan *pb.SubscribeRequest
+	done  <-chan struct{}
+}
+
+func (h Handle) Update(request *pb.SubscribeRequest) error {
+	select {
+	case <-h.done:
+		return &orbitflare.StreamError{Message: "stream closed"}
+	default:
+	}
+	select {
+	case h.cmdCh <- request:
+		return nil
+	case <-h.done:
+		return &orbitflare.StreamError{Message: "stream closed"}
+	}
+}
+
 type Stream struct {
 	ch     <-chan streaming.Result[*pb.SubscribeUpdate]
+	handle Handle
+	hub    *events.Hub
 	cancel context.CancelFunc
 }
 
@@ -43,29 +74,142 @@ func (s *Stream) Next(ctx context.Context) (*pb.SubscribeUpdate, error) {
 	}
 }
 
+func (s *Stream) Handle() Handle { return s.handle }
+
+func (s *Stream) Update(request *pb.SubscribeRequest) error { return s.handle.Update(request) }
+
+func (s *Stream) Events() *orbitflare.ConnectionEvents { return s.hub.Subscribe() }
+
 func (s *Stream) Close() { s.cancel() }
 
-func (c *Client) Subscribe(request *pb.SubscribeRequest) *Stream {
-	ctx, cancel := context.WithCancel(c.ctx)
-	ch := make(chan streaming.Result[*pb.SubscribeUpdate], c.cfg.ChannelCapacity)
-
-	go streaming.RunStream(ctx, c.cfg, "grpc", ch,
-		func(rctx context.Context, conn *grpc.ClientConn, onConnected func()) error {
-			return runConnection(rctx, conn, request, onConnected, ch, c.cfg)
-		})
-
-	return &Stream{ch: ch, cancel: cancel}
+type session struct {
+	fixed           *pb.SubscribeRequest
+	build           func(ConnectInfo) *pb.SubscribeRequest
+	commands        chan *pb.SubscribeRequest
+	connectedBefore bool
+	lastSlot        *uint64
 }
 
-func runConnection(ctx context.Context, conn *grpc.ClientConn, request *pb.SubscribeRequest, onConnected func(), out chan<- streaming.Result[*pb.SubscribeUpdate], cfg *streaming.Config) error {
-	stream, err := pb.NewGeyserClient(conn).Subscribe(ctx)
+func (s *session) request(info ConnectInfo) *pb.SubscribeRequest {
+	if s.build != nil {
+		return proto.Clone(s.build(info)).(*pb.SubscribeRequest)
+	}
+	return proto.Clone(s.fixed).(*pb.SubscribeRequest)
+}
+
+func (s *session) updated(request *pb.SubscribeRequest) *pb.SubscribeRequest {
+	update := proto.Clone(request).(*pb.SubscribeRequest)
+	update.FromSlot = nil
+	if s.build == nil {
+		s.fixed = update
+	}
+	return update
+}
+
+func (c *Client) Subscribe(request *pb.SubscribeRequest) *Stream {
+	return c.spawn(&session{fixed: proto.Clone(request).(*pb.SubscribeRequest)})
+}
+
+func (c *Client) SubscribeWith(build func(ConnectInfo) *pb.SubscribeRequest) *Stream {
+	return c.spawn(&session{build: build})
+}
+
+func (c *Client) spawn(sess *session) *Stream {
+	ctx, cancel := context.WithCancel(c.ctx)
+	ch := make(chan streaming.Result[*pb.SubscribeUpdate], c.cfg.ChannelCapacity)
+	sess.commands = make(chan *pb.SubscribeRequest, 256)
+	hub := events.NewHub()
+
+	go streaming.RunStream(ctx, c.cfg, "grpc", ch, hub,
+		func(rctx context.Context, conn *streaming.Conn) error {
+			return runConnection(rctx, conn, sess, ch, c.cfg)
+		})
+
+	return &Stream{
+		ch:     ch,
+		handle: Handle{cmdCh: sess.commands, done: ctx.Done()},
+		hub:    hub,
+		cancel: cancel,
+	}
+}
+
+func slotOf(update *pb.SubscribeUpdate) (uint64, bool) {
+	switch u := update.GetUpdateOneof().(type) {
+	case *pb.SubscribeUpdate_Slot:
+		return u.Slot.GetSlot(), true
+	case *pb.SubscribeUpdate_Transaction:
+		return u.Transaction.GetSlot(), true
+	case *pb.SubscribeUpdate_TransactionStatus:
+		return u.TransactionStatus.GetSlot(), true
+	case *pb.SubscribeUpdate_Account:
+		return u.Account.GetSlot(), true
+	case *pb.SubscribeUpdate_Block:
+		return u.Block.GetSlot(), true
+	case *pb.SubscribeUpdate_BlockMeta:
+		return u.BlockMeta.GetSlot(), true
+	case *pb.SubscribeUpdate_Entry:
+		return u.Entry.GetSlot(), true
+	}
+	return 0, false
+}
+
+func replayFrom(ctx context.Context, client pb.GeyserClient, conn *streaming.Conn, cfg *streaming.Config, wanted uint64) *uint64 {
+	rctx, cancel := context.WithTimeout(ctx, replayInfoTimeout)
+	defer cancel()
+	info, err := client.SubscribeReplayInfo(rctx, &pb.SubscribeReplayInfoRequest{})
 	if err != nil {
-		return orbitflare.NewTransportError(err)
+		cfg.Logger.Debug("replay window lookup failed; using from_slot as is", "error", err)
+		return &wanted
+	}
+	if info.FirstAvailable == nil {
+		cfg.Logger.Warn("endpoint does not support replay; starting live", "requested", wanted)
+		conn.Emit(orbitflare.ReplayUnavailable{Requested: wanted})
+		return nil
+	}
+	available := *info.FirstAvailable
+	if wanted < available {
+		cfg.Logger.Warn("from_slot is older than the replay window; starting at the oldest available slot",
+			"requested", wanted, "available", available)
+		conn.Emit(orbitflare.ReplayClamped{Requested: wanted, Available: available})
+		return &available
+	}
+	return &wanted
+}
+
+func runConnection(ctx context.Context, conn *streaming.Conn, sess *session, out chan<- streaming.Result[*pb.SubscribeUpdate], cfg *streaming.Config) error {
+	client := pb.NewGeyserClient(conn.ClientConn)
+
+	for drained := false; !drained; {
+		select {
+		case update := <-sess.commands:
+			sess.updated(update)
+		default:
+			drained = true
+		}
+	}
+	request := sess.request(ConnectInfo{
+		Endpoint:  conn.Endpoint,
+		Attempt:   conn.Attempt,
+		Reconnect: sess.connectedBefore,
+		LastSlot:  sess.lastSlot,
+	})
+	if request.FromSlot != nil {
+		request.FromSlot = replayFrom(ctx, client, conn, cfg, *request.FromSlot)
+	}
+
+	stream, err := client.Subscribe(ctx)
+	if err != nil {
+		return streaming.RecvError(err)
 	}
 	if err := stream.Send(request); err != nil {
-		return &orbitflare.StreamError{Message: "outbound closed"}
+		_, rerr := stream.Recv()
+		return streaming.RecvError(rerr)
 	}
-	onConnected()
+	if err := streaming.Header(stream, func() error { _, err := stream.Recv(); return err }); err != nil {
+		return err
+	}
+	conn.Connected()
+	sess.connectedBefore = true
 
 	msgCh := make(chan *pb.SubscribeUpdate, 64)
 	errCh := make(chan error, 1)
@@ -103,14 +247,23 @@ func runConnection(ctx context.Context, conn *grpc.ClientConn, request *pb.Subsc
 			return streaming.RecvError(err)
 
 		case update := <-msgCh:
+			missed = 0
+			conn.Message()
 			if update.GetPong() != nil {
-				missed = 0
 				continue
+			}
+			if slot, ok := slotOf(update); ok && (sess.lastSlot == nil || slot > *sess.lastSlot) {
+				sess.lastSlot = &slot
 			}
 			select {
 			case out <- streaming.Result[*pb.SubscribeUpdate]{Update: update}:
 			case <-ctx.Done():
 				return nil
+			}
+
+		case update := <-sess.commands:
+			if err := stream.Send(sess.updated(update)); err != nil {
+				return &orbitflare.StreamError{Message: "outbound closed"}
 			}
 
 		case <-ticker.C:
@@ -154,6 +307,8 @@ func (b *Builder) PingInterval(d time.Duration) *Builder { b.cfg.PingInterval(d)
 func (b *Builder) MaxMissedPongs(n uint32) *Builder { b.cfg.MaxMissedPongs(n); return b }
 
 func (b *Builder) ChannelCapacity(n int) *Builder { b.cfg.ChannelCapacity(n); return b }
+
+func (b *Builder) MaxDecodingMessageSize(n int) *Builder { b.cfg.MaxDecodingMessageSize(n); return b }
 
 func (b *Builder) Logger(l *slog.Logger) *Builder { b.cfg.Logger(l); return b }
 

@@ -187,7 +187,68 @@ func main() {
 
 `Subscribe` accepts a `*geyser.SubscribeRequest` (a re-export of the raw proto type), so you can also construct the request by hand instead of using the builder.
 
-Available filters: `TransactionFilter`, `AccountFilter` (with `Memcmp`, `Datasize`, `Lamports`, `TokenAccountState`), `SlotFilter`, `BlockFilter`, and `DeshredTransactionFilter`.
+Available filters: `TransactionFilter`, `AccountFilter` (with `Memcmp`, `Datasize`, `Lamports`, `TokenAccountState`), `SlotFilter`, `BlockFilter`, `BlockFooterFilter`, and `DeshredTransactionFilter`.
+
+### Block footers
+
+Alpenglow block footers arrive as their own `BlockFooter` update as soon as the validator reports them, without waiting for the block. Join them with other per-block updates on `(Slot, BankId)`. Certificates are opt-in, and their BLS signatures are not verified:
+
+```go
+request := geyser.NewSubscribeRequestBuilder().
+    BlockFooter("footers", geyser.NewBlockFooterFilter().IncludeCertificates(true)).
+    Commitment(geyser.Processed).
+    Build()
+
+stream := client.Subscribe(request)
+for {
+    update, err := stream.Next(ctx)
+    if err != nil {
+        break
+    }
+    if footer := update.GetBlockFooter(); footer != nil {
+        fmt.Printf("slot=%d bankId=%d finalCert=%v\n", footer.Slot, footer.BankId, footer.BlockFinalCert != nil)
+    }
+}
+```
+
+### Resuming after a reconnect
+
+`Subscribe` sends the same request on every reconnect. `SubscribeWith` builds the request for each connection instead, so a reconnect can resume from where the stream left off and pick up your current filters. The callback gets the endpoint, the attempt number, whether this is a reconnect, and the highest slot the stream has seen:
+
+```go
+const jupiter = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+
+stream := client.SubscribeWith(func(info geyser.ConnectInfo) *geyser.SubscribeRequest {
+    request := geyser.NewSubscribeRequestBuilder().
+        Transactions("swaps", geyser.NewTransactionFilter().Vote(false).AccountInclude(jupiter)).
+        Commitment(geyser.Confirmed).
+        Build()
+    if info.LastSlot != nil {
+        from := *info.LastSlot - 32
+        request.FromSlot = &from
+    }
+    return request
+})
+```
+
+Resume a few slots back rather than at `LastSlot + 1`: the last slot may have been cut off part way through, and the replay sends its remaining updates again, so deduplicate by signature.
+
+When a request sets `FromSlot`, the stream first asks the server how far back it can replay. A slot older than that starts at the oldest available one, and a server without replay starts live, instead of failing the subscription. Both are reported as connection events (below).
+
+### Changing filters on a live stream
+
+Yellowstone applies a new request on an open stream in place of the previous one, so filters can change without reconnecting and without missing anything in between. `Update` sends one; `Handle()` gives a handle that can be passed around:
+
+```go
+const pump = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+handle := stream.Handle()
+err := handle.Update(geyser.NewSubscribeRequestBuilder().
+    Transactions("swaps", geyser.NewTransactionFilter().Vote(false).AccountInclude(jupiter, pump)).
+    Build())
+```
+
+`FromSlot` is ignored on an update. A stream opened with `Subscribe` keeps the updated request for later reconnects; one opened with `SubscribeWith` calls its callback, which should reflect the change.
 
 ## Jetstream
 
@@ -315,6 +376,23 @@ for {
 }
 ```
 
+Opt into Alpenglow block footers on the same stream. They arrive as `SLOT_STATUS_BLOCK_FOOTER` events, at most once per slot, and are not ordered relative to `SLOT_STATUS_COMPLETE`. The certificates' BLS signatures are not verified, so treat a footer as the leader's claim, not proof of finality:
+
+```go
+import pb "github.com/orbitflare/orbitflare-sdk-go/proto/jetstreamv2"
+
+slots := client.SubscribeSlotsWithBlockFooters()
+for {
+    event, err := slots.Next(ctx)
+    if err != nil {
+        break
+    }
+    if event.GetStatus() == pb.SlotStatus_SLOT_STATUS_BLOCK_FOOTER {
+        fmt.Printf("slot=%d bankHash=%x\n", event.GetBlockFooter().GetSlot(), event.GetBlockFooter().GetBankHash())
+    }
+}
+```
+
 ## WebSocket
 
 ```go
@@ -387,7 +465,7 @@ client, err := geyser.NewBuilder().
     Build()
 ```
 
-All three streaming clients reconnect automatically on disconnection. WebSocket also re-subscribes all active subscriptions after reconnecting.
+All three streaming clients reconnect automatically on disconnection. WebSocket also re-subscribes all active subscriptions after reconnecting. A gRPC or Jetstream request the server rejects as invalid, unauthenticated, forbidden or unimplemented ends the stream with that error instead of reconnecting, and only a connection that delivered a message resets the retry count.
 
 Configure retry behavior with a `RetryPolicy`:
 
@@ -427,6 +505,44 @@ for {
 }
 ```
 
+### Connection events
+
+Reconnects are invisible in the update stream itself. Every gRPC and Jetstream stream (v1 and v2, transactions and slots) also reports its connection lifecycle, for health checks, metrics, or deciding a gap needs backfilling:
+
+```go
+events := stream.Events()
+for {
+    event, ok := events.Recv(ctx)
+    if !ok {
+        break // the stream ended
+    }
+    switch e := event.(type) {
+    case orbitflare.Connecting:
+        fmt.Printf("connecting to %s (try %d)\n", e.Endpoint, e.Attempt)
+    case orbitflare.Connected:
+        fmt.Printf("streaming from %s\n", e.Endpoint)
+    case orbitflare.Disconnected:
+        if e.WillRetry {
+            fmt.Printf("%s dropped (%s); retrying in %v\n", e.Endpoint, e.Error, e.RetryIn)
+        } else {
+            fmt.Printf("%s dropped (%s); giving up\n", e.Endpoint, e.Error)
+        }
+    case orbitflare.ReplayClamped:
+        fmt.Printf("slots %d..%d are no longer replayable\n", e.Requested, e.Available)
+    case orbitflare.ReplayUnavailable:
+        fmt.Printf("no replay; started live instead of at %d\n", e.Requested)
+    case orbitflare.Lagged:
+        fmt.Printf("missed %d events\n", e.Missed)
+    }
+}
+```
+
+Events never hold the stream back: a reader that falls behind by more than 256 events gets `Lagged` instead. The first call to `Events()` also returns what happened before it was called. `Recv(ctx)` waits for the next event and `TryRecv()` returns at once.
+
+### Connection settings
+
+gRPC and Jetstream connections send HTTP/2 keepalive pings every 20 seconds (`.Keepalive(d)`) and accept messages up to 64 MiB (grpc-go's own default of 4 MiB rejects some blocks). Change the limit with `.MaxDecodingMessageSize(bytes)` on the builder.
+
 ## Errors
 
 Errors are typed. Match them with `errors.As`:
@@ -448,7 +564,7 @@ Set `ORBITFLARE_LOG` (`trace|debug|info|warn|error|silent`, default `silent`) fo
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `ORBITFLARE_LICENSE_KEY` | RPC, WebSocket | API key appended to endpoint URLs |
+| `ORBITFLARE_LICENSE_KEY` | all | API key: appended to RPC and WebSocket URLs, sent as `x-token` to gRPC and Jetstream |
 | `ORBITFLARE_RPC_URL` | RPC | Default endpoint if `URL()` is not called |
 | `ORBITFLARE_WS_URL` | WebSocket | Default endpoint if `URL()` is not called |
 | `ORBITFLARE_GRPC_URL` | gRPC | Default endpoint if `URL()` is not called |
@@ -457,7 +573,7 @@ Set `ORBITFLARE_LOG` (`trace|debug|info|warn|error|silent`, default `silent`) fo
 
 ## Examples
 
-Runnable programs live in [`examples/`](examples): `rpc`, `das`, `ws`, `geyser`, `jetstream`, and `jetstream_v2`.
+Runnable programs live in [`examples/`](examples): `rpc`, `das`, `ws`, `geyser`, `geyser_block_footers`, `jetstream`, `jetstream_v2`, and `jetstream_v2_slots`.
 
 ```bash
 ORBITFLARE_LICENSE_KEY=ORBIT-... go run ./examples/rpc

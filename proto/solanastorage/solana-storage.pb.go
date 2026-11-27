@@ -30,6 +30,7 @@ const (
 	RewardType_Staking          RewardType = 3
 	RewardType_Voting           RewardType = 4
 	RewardType_DeactivatedStake RewardType = 5
+	RewardType_VATDebit         RewardType = 6
 )
 
 // Enum value maps for RewardType.
@@ -41,6 +42,7 @@ var (
 		3: "Staking",
 		4: "Voting",
 		5: "DeactivatedStake",
+		6: "VATDebit",
 	}
 	RewardType_value = map[string]int32{
 		"Unspecified":      0,
@@ -49,6 +51,7 @@ var (
 		"Staking":          3,
 		"Voting":           4,
 		"DeactivatedStake": 5,
+		"VATDebit":         6,
 	}
 )
 
@@ -291,9 +294,10 @@ type Message struct {
 	Instructions        []*CompiledInstruction       `protobuf:"bytes,4,rep,name=instructions,proto3" json:"instructions,omitempty"`
 	Versioned           bool                         `protobuf:"varint,5,opt,name=versioned,proto3" json:"versioned,omitempty"`
 	AddressTableLookups []*MessageAddressTableLookup `protobuf:"bytes,6,rep,name=address_table_lookups,json=addressTableLookups,proto3" json:"address_table_lookups,omitempty"`
-	Config              *TransactionConfig           `protobuf:"bytes,7,opt,name=config,proto3,oneof" json:"config,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Set only for V1 transaction messages (SIMD-0385). Absent for legacy/V0.
+	Config        *TransactionConfig `protobuf:"bytes,7,opt,name=config,proto3,oneof" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Message) Reset() {
@@ -375,6 +379,10 @@ func (x *Message) GetConfig() *TransactionConfig {
 	return nil
 }
 
+// Inline budget config introduced by the V1 transaction format (SIMD-0385),
+// replacing ComputeBudget instructions. Each field is optional; unset fields
+// fall back to the runtime defaults.
+// https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0385-transaction-v1.md
 type TransactionConfig struct {
 	state                       protoimpl.MessageState `protogen:"open.v1"`
 	PriorityFee                 *uint64                `protobuf:"varint,1,opt,name=priority_fee,json=priorityFee,proto3,oneof" json:"priority_fee,omitempty"`
@@ -580,10 +588,14 @@ type TransactionStatusMeta struct {
 	LoadedReadonlyAddresses [][]byte               `protobuf:"bytes,13,rep,name=loaded_readonly_addresses,json=loadedReadonlyAddresses,proto3" json:"loaded_readonly_addresses,omitempty"`
 	ReturnData              *ReturnData            `protobuf:"bytes,14,opt,name=return_data,json=returnData,proto3" json:"return_data,omitempty"`
 	ReturnDataNone          bool                   `protobuf:"varint,15,opt,name=return_data_none,json=returnDataNone,proto3" json:"return_data_none,omitempty"`
-	ComputeUnitsConsumed    *uint64                `protobuf:"varint,16,opt,name=compute_units_consumed,json=computeUnitsConsumed,proto3,oneof" json:"compute_units_consumed,omitempty"`
-	CostUnits               *uint64                `protobuf:"varint,17,opt,name=cost_units,json=costUnits,proto3,oneof" json:"cost_units,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Sum of compute units consumed by all instructions.
+	// Available since Solana v1.10.35 / v1.11.6.
+	// Set to `None` for txs executed on earlier versions.
+	ComputeUnitsConsumed *uint64 `protobuf:"varint,16,opt,name=compute_units_consumed,json=computeUnitsConsumed,proto3,oneof" json:"compute_units_consumed,omitempty"`
+	// Total transaction cost
+	CostUnits     *uint64 `protobuf:"varint,17,opt,name=cost_units,json=costUnits,proto3,oneof" json:"cost_units,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransactionStatusMeta) Reset() {
@@ -836,9 +848,12 @@ type InnerInstruction struct {
 	ProgramIdIndex uint32                 `protobuf:"varint,1,opt,name=program_id_index,json=programIdIndex,proto3" json:"program_id_index,omitempty"`
 	Accounts       []byte                 `protobuf:"bytes,2,opt,name=accounts,proto3" json:"accounts,omitempty"`
 	Data           []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
-	StackHeight    *uint32                `protobuf:"varint,4,opt,name=stack_height,json=stackHeight,proto3,oneof" json:"stack_height,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Invocation stack height of an inner instruction.
+	// Available since Solana v1.14.6
+	// Set to `None` for txs executed on earlier versions.
+	StackHeight   *uint32 `protobuf:"varint,4,opt,name=stack_height,json=stackHeight,proto3,oneof" json:"stack_height,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *InnerInstruction) Reset() {
@@ -1548,7 +1563,7 @@ const file_solana_storage_proto_rawDesc = "" +
 	"\vBlockHeight\x12!\n" +
 	"\fblock_height\x18\x01 \x01(\x04R\vblockHeight\"6\n" +
 	"\rNumPartitions\x12%\n" +
-	"\x0enum_partitions\x18\x01 \x01(\x04R\rnumPartitions*_\n" +
+	"\x0enum_partitions\x18\x01 \x01(\x04R\rnumPartitions*m\n" +
 	"\n" +
 	"RewardType\x12\x0f\n" +
 	"\vUnspecified\x10\x00\x12\a\n" +
@@ -1557,7 +1572,8 @@ const file_solana_storage_proto_rawDesc = "" +
 	"\aStaking\x10\x03\x12\n" +
 	"\n" +
 	"\x06Voting\x10\x04\x12\x14\n" +
-	"\x10DeactivatedStake\x10\x05B\x8a\x02\n" +
+	"\x10DeactivatedStake\x10\x05\x12\f\n" +
+	"\bVATDebit\x10\x06B\x8a\x02\n" +
 	"!com.solana.storage.ConfirmedBlockB\x12SolanaStorageProtoP\x01Z;github.com/orbitflare/orbitflare-sdk-go/proto/solanastorage\xa2\x02\x03SSC\xaa\x02\x1dSolana.Storage.ConfirmedBlock\xca\x02\x1dSolana\\Storage\\ConfirmedBlock\xe2\x02)Solana\\Storage\\ConfirmedBlock\\GPBMetadata\xea\x02\x1fSolana::Storage::ConfirmedBlockb\x06proto3"
 
 var (

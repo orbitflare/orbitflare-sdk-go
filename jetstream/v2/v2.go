@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/orbitflare/orbitflare-sdk-go/internal/events"
 	"github.com/orbitflare/orbitflare-sdk-go/internal/streaming"
 	"github.com/orbitflare/orbitflare-sdk-go/orbitflare"
 	pb "github.com/orbitflare/orbitflare-sdk-go/proto/jetstreamv2"
@@ -119,6 +120,7 @@ func (h TxFilterHandle) send(cmd filterCommand) error {
 type TransactionStream struct {
 	ch     <-chan streaming.Result[*pb.SubscribeTransactionsResponse]
 	handle TxFilterHandle
+	hub    *events.Hub
 	cancel context.CancelFunc
 }
 
@@ -144,10 +146,13 @@ func (s *TransactionStream) RemoveFilters(filterIDs []string) error {
 	return s.handle.RemoveFilters(filterIDs)
 }
 
+func (s *TransactionStream) Events() *orbitflare.ConnectionEvents { return s.hub.Subscribe() }
+
 func (s *TransactionStream) Close() { s.cancel() }
 
 type SlotStream struct {
 	ch     <-chan streaming.Result[*pb.SlotEvent]
+	hub    *events.Hub
 	cancel context.CancelFunc
 }
 
@@ -163,6 +168,8 @@ func (s *SlotStream) Next(ctx context.Context) (*pb.SlotEvent, error) {
 	}
 }
 
+func (s *SlotStream) Events() *orbitflare.ConnectionEvents { return s.hub.Subscribe() }
+
 func (s *SlotStream) Close() { s.cancel() }
 
 func (c *Client) SubscribeTransactions(filters ...*pb.TxFilter) *TransactionStream {
@@ -175,28 +182,40 @@ func (c *Client) SubscribeTransactions(filters ...*pb.TxFilter) *TransactionStre
 		active[f.GetFilterId()] = f
 	}
 
-	go streaming.RunStream(ctx, c.cfg, "v2 tx", ch,
-		func(rctx context.Context, conn *grpc.ClientConn, onConnected func()) error {
-			return runTxConnection(rctx, conn, active, cmdCh, onConnected, ch, c.cfg)
+	hub := events.NewHub()
+
+	go streaming.RunStream(ctx, c.cfg, "v2 tx", ch, hub,
+		func(rctx context.Context, conn *streaming.Conn) error {
+			return runTxConnection(rctx, conn, active, cmdCh, ch, c.cfg)
 		})
 
 	return &TransactionStream{
 		ch:     ch,
 		handle: TxFilterHandle{cmdCh: cmdCh, done: ctx.Done()},
+		hub:    hub,
 		cancel: cancel,
 	}
 }
 
 func (c *Client) SubscribeSlots() *SlotStream {
+	return c.subscribeSlots(&pb.SubscribeSlotsRequest{})
+}
+
+func (c *Client) SubscribeSlotsWithBlockFooters() *SlotStream {
+	return c.subscribeSlots(&pb.SubscribeSlotsRequest{IncludeBlockFooter: true})
+}
+
+func (c *Client) subscribeSlots(request *pb.SubscribeSlotsRequest) *SlotStream {
 	ctx, cancel := context.WithCancel(c.ctx)
 	ch := make(chan streaming.Result[*pb.SlotEvent], c.cfg.ChannelCapacity)
+	hub := events.NewHub()
 
-	go streaming.RunStream(ctx, c.cfg, "v2 slots", ch,
-		func(rctx context.Context, conn *grpc.ClientConn, onConnected func()) error {
-			return runSlotConnection(rctx, conn, onConnected, ch)
+	go streaming.RunStream(ctx, c.cfg, "v2 slots", ch, hub,
+		func(rctx context.Context, conn *streaming.Conn) error {
+			return runSlotConnection(rctx, conn, request, ch)
 		})
 
-	return &SlotStream{ch: ch, cancel: cancel}
+	return &SlotStream{ch: ch, hub: hub, cancel: cancel}
 }
 
 func (c *Client) Ping(ctx context.Context, count int32) (int32, error) {
@@ -231,10 +250,10 @@ func pingReq(pingID int32) *pb.SubscribeTransactionsRequest {
 	}
 }
 
-func runTxConnection(ctx context.Context, conn *grpc.ClientConn, active map[string]*pb.TxFilter, cmdCh chan filterCommand, onConnected func(), out chan<- streaming.Result[*pb.SubscribeTransactionsResponse], cfg *streaming.Config) error {
-	stream, err := pb.NewJetstreamV2Client(conn).SubscribeTransactions(ctx)
+func runTxConnection(ctx context.Context, conn *streaming.Conn, active map[string]*pb.TxFilter, cmdCh chan filterCommand, out chan<- streaming.Result[*pb.SubscribeTransactionsResponse], cfg *streaming.Config) error {
+	stream, err := pb.NewJetstreamV2Client(conn.ClientConn).SubscribeTransactions(ctx)
 	if err != nil {
-		return orbitflare.NewTransportError(err)
+		return streaming.RecvError(err)
 	}
 
 	if len(active) > 0 {
@@ -243,10 +262,14 @@ func runTxConnection(ctx context.Context, conn *grpc.ClientConn, active map[stri
 			filters = append(filters, f)
 		}
 		if err := stream.Send(addFiltersReq(filters)); err != nil {
-			return &orbitflare.StreamError{Message: "outbound closed"}
+			_, rerr := stream.Recv()
+			return streaming.RecvError(rerr)
 		}
 	}
-	onConnected()
+	if err := streaming.Header(stream, func() error { _, err := stream.Recv(); return err }); err != nil {
+		return err
+	}
+	conn.Connected()
 
 	msgCh := make(chan *pb.SubscribeTransactionsResponse, 64)
 	errCh := make(chan error, 1)
@@ -285,6 +308,7 @@ func runTxConnection(ctx context.Context, conn *grpc.ClientConn, active map[stri
 
 		case resp := <-msgCh:
 			intervalsSinceTraffic = 0
+			conn.Message()
 			select {
 			case out <- streaming.Result[*pb.SubscribeTransactionsResponse]{Update: resp}:
 			case <-ctx.Done():
@@ -329,12 +353,15 @@ func runTxConnection(ctx context.Context, conn *grpc.ClientConn, active map[stri
 	}
 }
 
-func runSlotConnection(ctx context.Context, conn *grpc.ClientConn, onConnected func(), out chan<- streaming.Result[*pb.SlotEvent]) error {
-	stream, err := pb.NewJetstreamV2Client(conn).SubscribeSlots(ctx, &pb.SubscribeSlotsRequest{})
+func runSlotConnection(ctx context.Context, conn *streaming.Conn, request *pb.SubscribeSlotsRequest, out chan<- streaming.Result[*pb.SlotEvent]) error {
+	stream, err := pb.NewJetstreamV2Client(conn.ClientConn).SubscribeSlots(ctx, request)
 	if err != nil {
-		return orbitflare.NewTransportError(err)
+		return streaming.RecvError(err)
 	}
-	onConnected()
+	if err := streaming.Header(stream, func() error { _, err := stream.Recv(); return err }); err != nil {
+		return err
+	}
+	conn.Connected()
 
 	for {
 		event, err := stream.Recv()
@@ -344,6 +371,7 @@ func runSlotConnection(ctx context.Context, conn *grpc.ClientConn, onConnected f
 			}
 			return streaming.RecvError(err)
 		}
+		conn.Message()
 		select {
 		case out <- streaming.Result[*pb.SlotEvent]{Update: event}:
 		case <-ctx.Done():
@@ -369,6 +397,7 @@ func (b *Builder) Keepalive(d time.Duration) *Builder      { b.cfg.Keepalive(d);
 func (b *Builder) PingInterval(d time.Duration) *Builder   { b.cfg.PingInterval(d); return b }
 func (b *Builder) MaxMissedPongs(n uint32) *Builder        { b.cfg.MaxMissedPongs(n); return b }
 func (b *Builder) ChannelCapacity(n int) *Builder          { b.cfg.ChannelCapacity(n); return b }
+func (b *Builder) MaxDecodingMessageSize(n int) *Builder   { b.cfg.MaxDecodingMessageSize(n); return b }
 func (b *Builder) Logger(l *slog.Logger) *Builder          { b.cfg.Logger(l); return b }
 
 func (b *Builder) Build() (*Client, error) {

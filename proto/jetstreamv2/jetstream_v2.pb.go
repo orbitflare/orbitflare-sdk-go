@@ -29,6 +29,13 @@ const (
 	SlotStatus_SLOT_STATUS_ALIVE       SlotStatus = 1 // first shred of this slot received
 	SlotStatus_SLOT_STATUS_COMPLETE    SlotStatus = 2 // last shred of this slot received
 	SlotStatus_SLOT_STATUS_DEAD        SlotStatus = 3 // slot skipped, or superseded by later slots without completing
+	// The slot's block footer; SlotEvent.block_footer is set. Sent only to
+	// streams that set include_block_footer, at most once per slot. It usually
+	// arrives right around COMPLETE, before or after it (the two are not
+	// ordered), and can also follow DEAD or arrive for a slot that never gets
+	// COMPLETE. It does not change the slot's status and is not a terminal
+	// event. A slot without a footer gets no such event.
+	SlotStatus_SLOT_STATUS_BLOCK_FOOTER SlotStatus = 4
 )
 
 // Enum value maps for SlotStatus.
@@ -38,12 +45,14 @@ var (
 		1: "SLOT_STATUS_ALIVE",
 		2: "SLOT_STATUS_COMPLETE",
 		3: "SLOT_STATUS_DEAD",
+		4: "SLOT_STATUS_BLOCK_FOOTER",
 	}
 	SlotStatus_value = map[string]int32{
-		"SLOT_STATUS_UNSPECIFIED": 0,
-		"SLOT_STATUS_ALIVE":       1,
-		"SLOT_STATUS_COMPLETE":    2,
-		"SLOT_STATUS_DEAD":        3,
+		"SLOT_STATUS_UNSPECIFIED":  0,
+		"SLOT_STATUS_ALIVE":        1,
+		"SLOT_STATUS_COMPLETE":     2,
+		"SLOT_STATUS_DEAD":         3,
+		"SLOT_STATUS_BLOCK_FOOTER": 4,
 	}
 )
 
@@ -72,6 +81,49 @@ func (x SlotStatus) Number() protoreflect.EnumNumber {
 // Deprecated: Use SlotStatus.Descriptor instead.
 func (SlotStatus) EnumDescriptor() ([]byte, []int) {
 	return file_jetstream_v2_proto_rawDescGZIP(), []int{0}
+}
+
+type BlockFooterSignatureKind int32
+
+const (
+	BlockFooterSignatureKind_COMPRESSED_BLS12_381_G2 BlockFooterSignatureKind = 0
+)
+
+// Enum value maps for BlockFooterSignatureKind.
+var (
+	BlockFooterSignatureKind_name = map[int32]string{
+		0: "COMPRESSED_BLS12_381_G2",
+	}
+	BlockFooterSignatureKind_value = map[string]int32{
+		"COMPRESSED_BLS12_381_G2": 0,
+	}
+)
+
+func (x BlockFooterSignatureKind) Enum() *BlockFooterSignatureKind {
+	p := new(BlockFooterSignatureKind)
+	*p = x
+	return p
+}
+
+func (x BlockFooterSignatureKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BlockFooterSignatureKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_jetstream_v2_proto_enumTypes[1].Descriptor()
+}
+
+func (BlockFooterSignatureKind) Type() protoreflect.EnumType {
+	return &file_jetstream_v2_proto_enumTypes[1]
+}
+
+func (x BlockFooterSignatureKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BlockFooterSignatureKind.Descriptor instead.
+func (BlockFooterSignatureKind) EnumDescriptor() ([]byte, []int) {
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{1}
 }
 
 type SubscribeTransactionsRequest struct {
@@ -762,10 +814,20 @@ func (x *FilteredTransaction) GetTransaction() *TransactionMessage {
 	return nil
 }
 
-// TransactionMessage — a flat transaction representation (all fields inline).
+// TransactionMessage - a flat transaction representation (all fields inline).
+//
 // Fields 1-13 are the core transaction and are always present (the default
-// "lean" output). Fields 14-21 are optional enrichment, emitted only when the
-// session opts in via SubscribeRequestFilterTransactions.include_enrichment.
+// "lean" output). Fields 14-22 and 24 are optional enrichment, emitted only
+// when the session opts in via
+// SubscribeRequestFilterTransactions.include_enrichment.
+//
+// Field 23 (config) is NOT enrichment-gated: it is intrinsic transaction data
+// and is always sent when the transaction is V1.
+//
+// Fields 23-24 were added for SIMD-0385 Transaction V1. They are additive:
+// a client built against the previous version of this file skips them as
+// unknown fields and continues to decode every other field normally. No
+// action is required to keep working, and there is no opt-in flag.
 type TransactionMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Identity / placement
@@ -810,17 +872,39 @@ type TransactionMessage struct {
 	// getMultipleAccounts). Default false = fully resolved. Emitted only under
 	// enrichment (same gate as fields 14-21).
 	AltResolutionIncomplete bool `protobuf:"varint,22,opt,name=alt_resolution_incomplete,json=altResolutionIncomplete,proto3" json:"alt_resolution_incomplete,omitempty"`
-	// SIMD-0385 Transaction V1 config, carried in the message body. PRESENT ONLY
-	// FOR V1 (absent for legacy and V0); its presence is how you identify a V1
-	// transaction. Always sent (not enrichment-gated) — it is intrinsic tx data.
-	// version test: config present -> v1; else versioned -> v0; else legacy.
-	Config *TransactionConfig `protobuf:"bytes,23,opt,name=config,proto3,oneof" json:"config,omitempty"`
-	// Priority fee in TOTAL LAMPORTS, populated for ALL versions so they can be
-	// ranked against one another. Use this, not compute_unit_price (17), to sort
-	// by fee — field 17 is absent for every V1 tx. For v1 this is
-	// config.priority_fee; for legacy/v0 it is derived from the ComputeBudget
-	// instructions. Emitted only under enrichment.
-	PriorityFeeLamports *uint64 `protobuf:"varint,24,opt,name=priority_fee_lamports,json=priorityFeeLamports,proto3,oneof" json:"priority_fee_lamports,omitempty"`
+	// Transaction config, carried in the message body by V1 transactions.
+	//
+	// PRESENT ONLY FOR V1. Absent for legacy and V0. The presence of this field
+	// is how you identify a V1 transaction -- see the version table below.
+	//
+	// Always sent (not enrichment-gated), because it is intrinsic transaction
+	// data rather than something we derive.
+	//
+	//	version | versioned (fn 10) | config (fn 23)
+	//	--------|-------------------|----------------
+	//	legacy  | false             | absent
+	//	v0      | true              | absent
+	//	v1      | true              | PRESENT
+	//
+	// Test config first: `versioned` is true for both v0 and v1.
+	Config *TransactionConfig `protobuf:"bytes,23,opt,name=config,proto3" json:"config,omitempty"`
+	// Priority fee in TOTAL LAMPORTS, populated for ALL THREE versions so they
+	// can be ranked against one another.
+	//
+	// Use this, not compute_unit_price (fn 17), to order transactions by fee.
+	// Field 17 is micro-lamports per compute unit read from a
+	// SetComputeUnitPrice instruction; V1 has no such instruction, so field 17
+	// is ABSENT for every V1 transaction and sorting on it alone ranks all V1
+	// traffic last.
+	//
+	//	v1          : config.priority_fee verbatim
+	//	legacy / v0 : derived from the ComputeBudget instructions --
+	//	                limit = compute_unit_limit, or if unset
+	//	                        min(200000 * num_instructions, 1400000)
+	//	                fee   = ceil(limit * compute_unit_price / 1000000)
+	//
+	// Emitted only when the session opts into enrichment.
+	PriorityFeeLamports uint64 `protobuf:"varint,24,opt,name=priority_fee_lamports,json=priorityFeeLamports,proto3" json:"priority_fee_lamports,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -1017,23 +1101,57 @@ func (x *TransactionMessage) GetConfig() *TransactionConfig {
 }
 
 func (x *TransactionMessage) GetPriorityFeeLamports() uint64 {
-	if x != nil && x.PriorityFeeLamports != nil {
-		return *x.PriorityFeeLamports
+	if x != nil {
+		return x.PriorityFeeLamports
 	}
 	return 0
 }
 
-// Transaction-level configuration carried by V1 messages (SIMD-0385). Replaces
-// the ComputeBudget instructions used by legacy/V0. Explicit presence: an absent
-// field means the sender requested nothing, which is NOT the same as zero.
+// Transaction-level configuration carried by V1 messages (SIMD-0385).
+//
+// V1 replaces the ComputeBudget instructions used by legacy and V0 with four
+// values encoded directly in the message.
+//
+// A value of 0 means "not requested" for every field here, so you can read
+// the values directly without checking presence. config_mask records what
+// the sender literally set, if you need that.
+//
+// ComputeBudget instructions inside a V1 transaction are ignored by the
+// runtime even when present, so do not read configuration out of them for a
+// transaction that carries this message.
 type TransactionConfig struct {
-	state                       protoimpl.MessageState `protogen:"open.v1"`
-	PriorityFee                 *uint64                `protobuf:"varint,1,opt,name=priority_fee,json=priorityFee,proto3,oneof" json:"priority_fee,omitempty"`                                                       // TOTAL lamports, not per-CU. Absent = 0.
-	ComputeUnitLimit            *uint32                `protobuf:"varint,2,opt,name=compute_unit_limit,json=computeUnitLimit,proto3,oneof" json:"compute_unit_limit,omitempty"`                                      // Absent = 0 requested.
-	LoadedAccountsDataSizeLimit *uint32                `protobuf:"varint,3,opt,name=loaded_accounts_data_size_limit,json=loadedAccountsDataSizeLimit,proto3,oneof" json:"loaded_accounts_data_size_limit,omitempty"` // Bytes. Absent = 0 (legacy/V0 default is 64 MiB).
-	HeapSize                    *uint32                `protobuf:"varint,4,opt,name=heap_size,json=heapSize,proto3,oneof" json:"heap_size,omitempty"`                                                                // Bytes, multiple of 1024 in [32768, 262144]. Absent = 32 KiB default.
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Priority fee in TOTAL LAMPORTS. This is not a per-compute-unit price.
+	// 0 means no priority fee was requested.
+	PriorityFee uint64 `protobuf:"varint,1,opt,name=priority_fee,json=priorityFee,proto3" json:"priority_fee,omitempty"`
+	// Requested compute unit limit. 0 means 0 was requested, which SIMD-0385
+	// also makes the default when the field is not set -- the two are the same.
+	ComputeUnitLimit uint32 `protobuf:"varint,2,opt,name=compute_unit_limit,json=computeUnitLimit,proto3" json:"compute_unit_limit,omitempty"`
+	// Requested loaded accounts data size limit, in bytes. 0 means 0, which
+	// SIMD-0385 treats identically to unset (both reserve one 32 KiB page for
+	// cost-model purposes). Note this differs from legacy/V0, where the default
+	// is 64 MiB.
+	LoadedAccountsDataSizeLimit uint32 `protobuf:"varint,3,opt,name=loaded_accounts_data_size_limit,json=loadedAccountsDataSizeLimit,proto3" json:"loaded_accounts_data_size_limit,omitempty"`
+	// Requested heap size in bytes. When set it is always a multiple of 1024 in
+	// the inclusive range [32768, 262144], so 0 unambiguously means "not
+	// requested" and the 32 KiB default applies.
+	HeapSize uint32 `protobuf:"varint,4,opt,name=heap_size,json=heapSize,proto3" json:"heap_size,omitempty"`
+	// The raw SIMD-0385 TransactionConfigMask, exactly as it appeared in the
+	// transaction. This is the authoritative record of which values the sender
+	// actually requested:
+	//
+	//	bits 0-1  priority fee        (both bits set together, or neither)
+	//	bit  2    compute unit limit
+	//	bit  3    loaded accounts data size limit
+	//	bit  4    heap size
+	//
+	// You do not need this for normal use: for every field above, a value of 0
+	// and "not requested" mean the same thing, so you can read the values
+	// directly. It is here for callers that want to reproduce the sender's
+	// exact intent, and it is 0 when the sender requested nothing at all.
+	ConfigMask    uint32 `protobuf:"varint,5,opt,name=config_mask,json=configMask,proto3" json:"config_mask,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransactionConfig) Reset() {
@@ -1067,29 +1185,36 @@ func (*TransactionConfig) Descriptor() ([]byte, []int) {
 }
 
 func (x *TransactionConfig) GetPriorityFee() uint64 {
-	if x != nil && x.PriorityFee != nil {
-		return *x.PriorityFee
+	if x != nil {
+		return x.PriorityFee
 	}
 	return 0
 }
 
 func (x *TransactionConfig) GetComputeUnitLimit() uint32 {
-	if x != nil && x.ComputeUnitLimit != nil {
-		return *x.ComputeUnitLimit
+	if x != nil {
+		return x.ComputeUnitLimit
 	}
 	return 0
 }
 
 func (x *TransactionConfig) GetLoadedAccountsDataSizeLimit() uint32 {
-	if x != nil && x.LoadedAccountsDataSizeLimit != nil {
-		return *x.LoadedAccountsDataSizeLimit
+	if x != nil {
+		return x.LoadedAccountsDataSizeLimit
 	}
 	return 0
 }
 
 func (x *TransactionConfig) GetHeapSize() uint32 {
-	if x != nil && x.HeapSize != nil {
-		return *x.HeapSize
+	if x != nil {
+		return x.HeapSize
+	}
+	return 0
+}
+
+func (x *TransactionConfig) GetConfigMask() uint32 {
+	if x != nil {
+		return x.ConfigMask
 	}
 	return 0
 }
@@ -1214,11 +1339,14 @@ func (x *MessageAddressTableLookup) GetReadonlyIndexes() []byte {
 	return nil
 }
 
-// SubscribeSlots takes no request parameters.
 type SubscribeSlotsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Opt in to SLOT_STATUS_BLOCK_FOOTER events (Alpenglow block footers).
+	// Off by default: a client that leaves it unset gets exactly the events it
+	// got before this field existed.
+	IncludeBlockFooter bool `protobuf:"varint,1,opt,name=include_block_footer,json=includeBlockFooter,proto3" json:"include_block_footer,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SubscribeSlotsRequest) Reset() {
@@ -1251,6 +1379,13 @@ func (*SubscribeSlotsRequest) Descriptor() ([]byte, []int) {
 	return file_jetstream_v2_proto_rawDescGZIP(), []int{15}
 }
 
+func (x *SubscribeSlotsRequest) GetIncludeBlockFooter() bool {
+	if x != nil {
+		return x.IncludeBlockFooter
+	}
+	return false
+}
+
 type SlotEvent struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Slot   uint64                 `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
@@ -1260,8 +1395,10 @@ type SlotEvent struct {
 	CurrentLeader []byte `protobuf:"bytes,3,opt,name=current_leader,json=currentLeader,proto3" json:"current_leader,omitempty"`
 	// Parent slot, from the first shred received for this slot. 0 means
 	// "unknown parent" (e.g. a DEAD event for a slot that was never observed).
-	ParentSlot    uint64 `protobuf:"varint,4,opt,name=parent_slot,json=parentSlot,proto3" json:"parent_slot,omitempty"`
-	Sequence      uint64 `protobuf:"varint,5,opt,name=sequence,proto3" json:"sequence,omitempty"` // monotonic per-stream
+	ParentSlot uint64 `protobuf:"varint,4,opt,name=parent_slot,json=parentSlot,proto3" json:"parent_slot,omitempty"`
+	Sequence   uint64 `protobuf:"varint,5,opt,name=sequence,proto3" json:"sequence,omitempty"` // monotonic per-stream
+	// Set only when status == SLOT_STATUS_BLOCK_FOOTER.
+	BlockFooter   *BlockFooter `protobuf:"bytes,6,opt,name=block_footer,json=blockFooter,proto3" json:"block_footer,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1331,6 +1468,352 @@ func (x *SlotEvent) GetSequence() uint64 {
 	return 0
 }
 
+func (x *SlotEvent) GetBlockFooter() *BlockFooter {
+	if x != nil {
+		return x.BlockFooter
+	}
+	return nil
+}
+
+// Alpenglow block footer, delivered before the block has been executed.
+// The BLS signatures in the certificates are not checked: treat the
+// contents as the slot leader's claims, not as proof of finality.
+type BlockFooter struct {
+	state                  protoimpl.MessageState      `protogen:"open.v1"`
+	Slot                   uint64                      `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	BankHash               []byte                      `protobuf:"bytes,3,opt,name=bank_hash,json=bankHash,proto3" json:"bank_hash,omitempty"` // 32 bytes
+	BlockProducerTimeNanos uint64                      `protobuf:"varint,4,opt,name=block_producer_time_nanos,json=blockProducerTimeNanos,proto3" json:"block_producer_time_nanos,omitempty"`
+	BlockUserAgent         []byte                      `protobuf:"bytes,5,opt,name=block_user_agent,json=blockUserAgent,proto3" json:"block_user_agent,omitempty"` // 0-255 bytes, raw
+	BlockFinalCert         *BlockFooterFinalCert       `protobuf:"bytes,9,opt,name=block_final_cert,json=blockFinalCert,proto3" json:"block_final_cert,omitempty"`
+	SkipRewardCert         *BlockFooterSkipRewardCert  `protobuf:"bytes,10,opt,name=skip_reward_cert,json=skipRewardCert,proto3" json:"skip_reward_cert,omitempty"`
+	NotarRewardCert        *BlockFooterNotarRewardCert `protobuf:"bytes,11,opt,name=notar_reward_cert,json=notarRewardCert,proto3" json:"notar_reward_cert,omitempty"`
+	// 32 bytes: the Alpenglow block id, the same value validators vote on and
+	// certify, and that the next block names as its parent. Like the rest of
+	// the footer it is not verified against a signature. Empty when it could
+	// not be determined for this slot.
+	BlockId       []byte `protobuf:"bytes,100,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlockFooter) Reset() {
+	*x = BlockFooter{}
+	mi := &file_jetstream_v2_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockFooter) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockFooter) ProtoMessage() {}
+
+func (x *BlockFooter) ProtoReflect() protoreflect.Message {
+	mi := &file_jetstream_v2_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockFooter.ProtoReflect.Descriptor instead.
+func (*BlockFooter) Descriptor() ([]byte, []int) {
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *BlockFooter) GetSlot() uint64 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *BlockFooter) GetBankHash() []byte {
+	if x != nil {
+		return x.BankHash
+	}
+	return nil
+}
+
+func (x *BlockFooter) GetBlockProducerTimeNanos() uint64 {
+	if x != nil {
+		return x.BlockProducerTimeNanos
+	}
+	return 0
+}
+
+func (x *BlockFooter) GetBlockUserAgent() []byte {
+	if x != nil {
+		return x.BlockUserAgent
+	}
+	return nil
+}
+
+func (x *BlockFooter) GetBlockFinalCert() *BlockFooterFinalCert {
+	if x != nil {
+		return x.BlockFinalCert
+	}
+	return nil
+}
+
+func (x *BlockFooter) GetSkipRewardCert() *BlockFooterSkipRewardCert {
+	if x != nil {
+		return x.SkipRewardCert
+	}
+	return nil
+}
+
+func (x *BlockFooter) GetNotarRewardCert() *BlockFooterNotarRewardCert {
+	if x != nil {
+		return x.NotarRewardCert
+	}
+	return nil
+}
+
+func (x *BlockFooter) GetBlockId() []byte {
+	if x != nil {
+		return x.BlockId
+	}
+	return nil
+}
+
+type BlockFooterVotesAggregate struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	SignatureKind BlockFooterSignatureKind `protobuf:"varint,1,opt,name=signature_kind,json=signatureKind,proto3,enum=jetstream.v2.BlockFooterSignatureKind" json:"signature_kind,omitempty"`
+	Signature     []byte                   `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"`            // 96 bytes
+	BlockId       []byte                   `protobuf:"bytes,3,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"` // 32 bytes when the cert names a block, else empty
+	SignerBitmap  []byte                   `protobuf:"bytes,4,opt,name=signer_bitmap,json=signerBitmap,proto3" json:"signer_bitmap,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlockFooterVotesAggregate) Reset() {
+	*x = BlockFooterVotesAggregate{}
+	mi := &file_jetstream_v2_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockFooterVotesAggregate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockFooterVotesAggregate) ProtoMessage() {}
+
+func (x *BlockFooterVotesAggregate) ProtoReflect() protoreflect.Message {
+	mi := &file_jetstream_v2_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockFooterVotesAggregate.ProtoReflect.Descriptor instead.
+func (*BlockFooterVotesAggregate) Descriptor() ([]byte, []int) {
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *BlockFooterVotesAggregate) GetSignatureKind() BlockFooterSignatureKind {
+	if x != nil {
+		return x.SignatureKind
+	}
+	return BlockFooterSignatureKind_COMPRESSED_BLS12_381_G2
+}
+
+func (x *BlockFooterVotesAggregate) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+func (x *BlockFooterVotesAggregate) GetBlockId() []byte {
+	if x != nil {
+		return x.BlockId
+	}
+	return nil
+}
+
+func (x *BlockFooterVotesAggregate) GetSignerBitmap() []byte {
+	if x != nil {
+		return x.SignerBitmap
+	}
+	return nil
+}
+
+type BlockFooterFinalCert struct {
+	state          protoimpl.MessageState     `protogen:"open.v1"`
+	Slot           uint64                     `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	FinalAggregate *BlockFooterVotesAggregate `protobuf:"bytes,2,opt,name=final_aggregate,json=finalAggregate,proto3" json:"final_aggregate,omitempty"`
+	NotarAggregate *BlockFooterVotesAggregate `protobuf:"bytes,3,opt,name=notar_aggregate,json=notarAggregate,proto3" json:"notar_aggregate,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *BlockFooterFinalCert) Reset() {
+	*x = BlockFooterFinalCert{}
+	mi := &file_jetstream_v2_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockFooterFinalCert) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockFooterFinalCert) ProtoMessage() {}
+
+func (x *BlockFooterFinalCert) ProtoReflect() protoreflect.Message {
+	mi := &file_jetstream_v2_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockFooterFinalCert.ProtoReflect.Descriptor instead.
+func (*BlockFooterFinalCert) Descriptor() ([]byte, []int) {
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *BlockFooterFinalCert) GetSlot() uint64 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *BlockFooterFinalCert) GetFinalAggregate() *BlockFooterVotesAggregate {
+	if x != nil {
+		return x.FinalAggregate
+	}
+	return nil
+}
+
+func (x *BlockFooterFinalCert) GetNotarAggregate() *BlockFooterVotesAggregate {
+	if x != nil {
+		return x.NotarAggregate
+	}
+	return nil
+}
+
+type BlockFooterSkipRewardCert struct {
+	state         protoimpl.MessageState     `protogen:"open.v1"`
+	Slot          uint64                     `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	Aggregate     *BlockFooterVotesAggregate `protobuf:"bytes,2,opt,name=aggregate,proto3" json:"aggregate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlockFooterSkipRewardCert) Reset() {
+	*x = BlockFooterSkipRewardCert{}
+	mi := &file_jetstream_v2_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockFooterSkipRewardCert) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockFooterSkipRewardCert) ProtoMessage() {}
+
+func (x *BlockFooterSkipRewardCert) ProtoReflect() protoreflect.Message {
+	mi := &file_jetstream_v2_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockFooterSkipRewardCert.ProtoReflect.Descriptor instead.
+func (*BlockFooterSkipRewardCert) Descriptor() ([]byte, []int) {
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *BlockFooterSkipRewardCert) GetSlot() uint64 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *BlockFooterSkipRewardCert) GetAggregate() *BlockFooterVotesAggregate {
+	if x != nil {
+		return x.Aggregate
+	}
+	return nil
+}
+
+type BlockFooterNotarRewardCert struct {
+	state         protoimpl.MessageState     `protogen:"open.v1"`
+	Slot          uint64                     `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	Aggregate     *BlockFooterVotesAggregate `protobuf:"bytes,2,opt,name=aggregate,proto3" json:"aggregate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlockFooterNotarRewardCert) Reset() {
+	*x = BlockFooterNotarRewardCert{}
+	mi := &file_jetstream_v2_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockFooterNotarRewardCert) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockFooterNotarRewardCert) ProtoMessage() {}
+
+func (x *BlockFooterNotarRewardCert) ProtoReflect() protoreflect.Message {
+	mi := &file_jetstream_v2_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockFooterNotarRewardCert.ProtoReflect.Descriptor instead.
+func (*BlockFooterNotarRewardCert) Descriptor() ([]byte, []int) {
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *BlockFooterNotarRewardCert) GetSlot() uint64 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *BlockFooterNotarRewardCert) GetAggregate() *BlockFooterVotesAggregate {
+	if x != nil {
+		return x.Aggregate
+	}
+	return nil
+}
+
 type PingRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Count         int32                  `protobuf:"varint,1,opt,name=count,proto3" json:"count,omitempty"`
@@ -1340,7 +1823,7 @@ type PingRequest struct {
 
 func (x *PingRequest) Reset() {
 	*x = PingRequest{}
-	mi := &file_jetstream_v2_proto_msgTypes[17]
+	mi := &file_jetstream_v2_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1352,7 +1835,7 @@ func (x *PingRequest) String() string {
 func (*PingRequest) ProtoMessage() {}
 
 func (x *PingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_jetstream_v2_proto_msgTypes[17]
+	mi := &file_jetstream_v2_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1365,7 +1848,7 @@ func (x *PingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingRequest.ProtoReflect.Descriptor instead.
 func (*PingRequest) Descriptor() ([]byte, []int) {
-	return file_jetstream_v2_proto_rawDescGZIP(), []int{17}
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PingRequest) GetCount() int32 {
@@ -1384,7 +1867,7 @@ type PongResponse struct {
 
 func (x *PongResponse) Reset() {
 	*x = PongResponse{}
-	mi := &file_jetstream_v2_proto_msgTypes[18]
+	mi := &file_jetstream_v2_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1396,7 +1879,7 @@ func (x *PongResponse) String() string {
 func (*PongResponse) ProtoMessage() {}
 
 func (x *PongResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_jetstream_v2_proto_msgTypes[18]
+	mi := &file_jetstream_v2_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1409,7 +1892,7 @@ func (x *PongResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PongResponse.ProtoReflect.Descriptor instead.
 func (*PongResponse) Descriptor() ([]byte, []int) {
-	return file_jetstream_v2_proto_rawDescGZIP(), []int{18}
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PongResponse) GetCount() int32 {
@@ -1427,7 +1910,7 @@ type GetVersionRequest struct {
 
 func (x *GetVersionRequest) Reset() {
 	*x = GetVersionRequest{}
-	mi := &file_jetstream_v2_proto_msgTypes[19]
+	mi := &file_jetstream_v2_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1439,7 +1922,7 @@ func (x *GetVersionRequest) String() string {
 func (*GetVersionRequest) ProtoMessage() {}
 
 func (x *GetVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_jetstream_v2_proto_msgTypes[19]
+	mi := &file_jetstream_v2_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1452,7 +1935,7 @@ func (x *GetVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVersionRequest.ProtoReflect.Descriptor instead.
 func (*GetVersionRequest) Descriptor() ([]byte, []int) {
-	return file_jetstream_v2_proto_rawDescGZIP(), []int{19}
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{24}
 }
 
 type GetVersionResponse struct {
@@ -1464,7 +1947,7 @@ type GetVersionResponse struct {
 
 func (x *GetVersionResponse) Reset() {
 	*x = GetVersionResponse{}
-	mi := &file_jetstream_v2_proto_msgTypes[20]
+	mi := &file_jetstream_v2_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1476,7 +1959,7 @@ func (x *GetVersionResponse) String() string {
 func (*GetVersionResponse) ProtoMessage() {}
 
 func (x *GetVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_jetstream_v2_proto_msgTypes[20]
+	mi := &file_jetstream_v2_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1489,7 +1972,7 @@ func (x *GetVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVersionResponse.ProtoReflect.Descriptor instead.
 func (*GetVersionResponse) Descriptor() ([]byte, []int) {
-	return file_jetstream_v2_proto_rawDescGZIP(), []int{20}
+	return file_jetstream_v2_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *GetVersionResponse) GetVersion() string {
@@ -1547,7 +2030,7 @@ const file_jetstream_v2_proto_rawDesc = "" +
 	"\x13FilteredTransaction\x12\x1d\n" +
 	"\n" +
 	"filter_ids\x18\x01 \x03(\tR\tfilterIds\x12B\n" +
-	"\vtransaction\x18\x02 \x01(\v2 .jetstream.v2.TransactionMessageR\vtransaction\"\x8f\t\n" +
+	"\vtransaction\x18\x02 \x01(\v2 .jetstream.v2.TransactionMessageR\vtransaction\"\xe0\b\n" +
 	"\x12TransactionMessage\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x04R\x04slot\x12\x1c\n" +
 	"\tsignature\x18\x02 \x01(\fR\tsignature\x12\x19\n" +
@@ -1574,21 +2057,16 @@ const file_jetstream_v2_proto_rawDesc = "" +
 	"\atx_size\x18\x13 \x01(\rR\x06txSize\x12:\n" +
 	"\x19loaded_writable_addresses\x18\x14 \x03(\fR\x17loadedWritableAddresses\x12:\n" +
 	"\x19loaded_readonly_addresses\x18\x15 \x03(\fR\x17loadedReadonlyAddresses\x12:\n" +
-	"\x19alt_resolution_incomplete\x18\x16 \x01(\bR\x17altResolutionIncomplete\x12<\n" +
-	"\x06config\x18\x17 \x01(\v2\x1f.jetstream.v2.TransactionConfigH\x00R\x06config\x88\x01\x01\x127\n" +
-	"\x15priority_fee_lamports\x18\x18 \x01(\x04H\x01R\x13priorityFeeLamports\x88\x01\x01B\t\n" +
-	"\a_configB\x18\n" +
-	"\x16_priority_fee_lamports\"\xb5\x02\n" +
-	"\x11TransactionConfig\x12&\n" +
-	"\fpriority_fee\x18\x01 \x01(\x04H\x00R\vpriorityFee\x88\x01\x01\x121\n" +
-	"\x12compute_unit_limit\x18\x02 \x01(\rH\x01R\x10computeUnitLimit\x88\x01\x01\x12I\n" +
-	"\x1floaded_accounts_data_size_limit\x18\x03 \x01(\rH\x02R\x1bloadedAccountsDataSizeLimit\x88\x01\x01\x12 \n" +
-	"\theap_size\x18\x04 \x01(\rH\x03R\bheapSize\x88\x01\x01B\x0f\n" +
-	"\r_priority_feeB\x15\n" +
-	"\x13_compute_unit_limitB\"\n" +
-	" _loaded_accounts_data_size_limitB\f\n" +
-	"\n" +
-	"_heap_size\"o\n" +
+	"\x19alt_resolution_incomplete\x18\x16 \x01(\bR\x17altResolutionIncomplete\x127\n" +
+	"\x06config\x18\x17 \x01(\v2\x1f.jetstream.v2.TransactionConfigR\x06config\x122\n" +
+	"\x15priority_fee_lamports\x18\x18 \x01(\x04R\x13priorityFeeLamports\"\xe8\x01\n" +
+	"\x11TransactionConfig\x12!\n" +
+	"\fpriority_fee\x18\x01 \x01(\x04R\vpriorityFee\x12,\n" +
+	"\x12compute_unit_limit\x18\x02 \x01(\rR\x10computeUnitLimit\x12D\n" +
+	"\x1floaded_accounts_data_size_limit\x18\x03 \x01(\rR\x1bloadedAccountsDataSizeLimit\x12\x1b\n" +
+	"\theap_size\x18\x04 \x01(\rR\bheapSize\x12\x1f\n" +
+	"\vconfig_mask\x18\x05 \x01(\rR\n" +
+	"configMask\"o\n" +
 	"\x13CompiledInstruction\x12(\n" +
 	"\x10program_id_index\x18\x01 \x01(\rR\x0eprogramIdIndex\x12\x1a\n" +
 	"\baccounts\x18\x02 \x01(\fR\baccounts\x12\x12\n" +
@@ -1597,28 +2075,58 @@ const file_jetstream_v2_proto_rawDesc = "" +
 	"\vaccount_key\x18\x01 \x01(\fR\n" +
 	"accountKey\x12)\n" +
 	"\x10writable_indexes\x18\x02 \x01(\fR\x0fwritableIndexes\x12)\n" +
-	"\x10readonly_indexes\x18\x03 \x01(\fR\x0freadonlyIndexes\"\x17\n" +
-	"\x15SubscribeSlotsRequest\"\xb5\x01\n" +
+	"\x10readonly_indexes\x18\x03 \x01(\fR\x0freadonlyIndexes\"I\n" +
+	"\x15SubscribeSlotsRequest\x120\n" +
+	"\x14include_block_footer\x18\x01 \x01(\bR\x12includeBlockFooter\"\xf3\x01\n" +
 	"\tSlotEvent\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x04R\x04slot\x120\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x18.jetstream.v2.SlotStatusR\x06status\x12%\n" +
 	"\x0ecurrent_leader\x18\x03 \x01(\fR\rcurrentLeader\x12\x1f\n" +
 	"\vparent_slot\x18\x04 \x01(\x04R\n" +
 	"parentSlot\x12\x1a\n" +
-	"\bsequence\x18\x05 \x01(\x04R\bsequence\"#\n" +
+	"\bsequence\x18\x05 \x01(\x04R\bsequence\x12<\n" +
+	"\fblock_footer\x18\x06 \x01(\v2\x19.jetstream.v2.BlockFooterR\vblockFooter\"\xcd\x03\n" +
+	"\vBlockFooter\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x04R\x04slot\x12\x1b\n" +
+	"\tbank_hash\x18\x03 \x01(\fR\bbankHash\x129\n" +
+	"\x19block_producer_time_nanos\x18\x04 \x01(\x04R\x16blockProducerTimeNanos\x12(\n" +
+	"\x10block_user_agent\x18\x05 \x01(\fR\x0eblockUserAgent\x12L\n" +
+	"\x10block_final_cert\x18\t \x01(\v2\".jetstream.v2.BlockFooterFinalCertR\x0eblockFinalCert\x12Q\n" +
+	"\x10skip_reward_cert\x18\n" +
+	" \x01(\v2'.jetstream.v2.BlockFooterSkipRewardCertR\x0eskipRewardCert\x12T\n" +
+	"\x11notar_reward_cert\x18\v \x01(\v2(.jetstream.v2.BlockFooterNotarRewardCertR\x0fnotarRewardCert\x12\x19\n" +
+	"\bblock_id\x18d \x01(\fR\ablockIdJ\x04\b\x02\x10\x03J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\t\"\xc8\x01\n" +
+	"\x19BlockFooterVotesAggregate\x12M\n" +
+	"\x0esignature_kind\x18\x01 \x01(\x0e2&.jetstream.v2.BlockFooterSignatureKindR\rsignatureKind\x12\x1c\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\x12\x19\n" +
+	"\bblock_id\x18\x03 \x01(\fR\ablockId\x12#\n" +
+	"\rsigner_bitmap\x18\x04 \x01(\fR\fsignerBitmap\"\xce\x01\n" +
+	"\x14BlockFooterFinalCert\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x04R\x04slot\x12P\n" +
+	"\x0ffinal_aggregate\x18\x02 \x01(\v2'.jetstream.v2.BlockFooterVotesAggregateR\x0efinalAggregate\x12P\n" +
+	"\x0fnotar_aggregate\x18\x03 \x01(\v2'.jetstream.v2.BlockFooterVotesAggregateR\x0enotarAggregate\"v\n" +
+	"\x19BlockFooterSkipRewardCert\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x04R\x04slot\x12E\n" +
+	"\taggregate\x18\x02 \x01(\v2'.jetstream.v2.BlockFooterVotesAggregateR\taggregate\"w\n" +
+	"\x1aBlockFooterNotarRewardCert\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x04R\x04slot\x12E\n" +
+	"\taggregate\x18\x02 \x01(\v2'.jetstream.v2.BlockFooterVotesAggregateR\taggregate\"#\n" +
 	"\vPingRequest\x12\x14\n" +
 	"\x05count\x18\x01 \x01(\x05R\x05count\"$\n" +
 	"\fPongResponse\x12\x14\n" +
 	"\x05count\x18\x01 \x01(\x05R\x05count\"\x13\n" +
 	"\x11GetVersionRequest\".\n" +
 	"\x12GetVersionResponse\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\tR\aversion*p\n" +
+	"\aversion\x18\x01 \x01(\tR\aversion*\x8e\x01\n" +
 	"\n" +
 	"SlotStatus\x12\x1b\n" +
 	"\x17SLOT_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11SLOT_STATUS_ALIVE\x10\x01\x12\x18\n" +
 	"\x14SLOT_STATUS_COMPLETE\x10\x02\x12\x14\n" +
-	"\x10SLOT_STATUS_DEAD\x10\x032\xed\x02\n" +
+	"\x10SLOT_STATUS_DEAD\x10\x03\x12\x1c\n" +
+	"\x18SLOT_STATUS_BLOCK_FOOTER\x10\x04*7\n" +
+	"\x18BlockFooterSignatureKind\x12\x1b\n" +
+	"\x17COMPRESSED_BLS12_381_G2\x10\x002\xed\x02\n" +
 	"\vJetstreamV2\x12v\n" +
 	"\x15SubscribeTransactions\x12*.jetstream.v2.SubscribeTransactionsRequest\x1a+.jetstream.v2.SubscribeTransactionsResponse\"\x00(\x010\x01\x12R\n" +
 	"\x0eSubscribeSlots\x12#.jetstream.v2.SubscribeSlotsRequest\x1a\x17.jetstream.v2.SlotEvent\"\x000\x01\x12?\n" +
@@ -1639,62 +2147,77 @@ func file_jetstream_v2_proto_rawDescGZIP() []byte {
 	return file_jetstream_v2_proto_rawDescData
 }
 
-var file_jetstream_v2_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_jetstream_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_jetstream_v2_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_jetstream_v2_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_jetstream_v2_proto_goTypes = []any{
 	(SlotStatus)(0),                            // 0: jetstream.v2.SlotStatus
-	(*SubscribeTransactionsRequest)(nil),       // 1: jetstream.v2.SubscribeTransactionsRequest
-	(*Ping)(nil),                               // 2: jetstream.v2.Ping
-	(*AddFilters)(nil),                         // 3: jetstream.v2.AddFilters
-	(*TxFilter)(nil),                           // 4: jetstream.v2.TxFilter
-	(*SubscribeRequestFilterTransactions)(nil), // 5: jetstream.v2.SubscribeRequestFilterTransactions
-	(*RemoveFilters)(nil),                      // 6: jetstream.v2.RemoveFilters
-	(*SubscribeTransactionsResponse)(nil),      // 7: jetstream.v2.SubscribeTransactionsResponse
-	(*Pong)(nil),                               // 8: jetstream.v2.Pong
-	(*FilterResult)(nil),                       // 9: jetstream.v2.FilterResult
-	(*Heartbeat)(nil),                          // 10: jetstream.v2.Heartbeat
-	(*FilteredTransaction)(nil),                // 11: jetstream.v2.FilteredTransaction
-	(*TransactionMessage)(nil),                 // 12: jetstream.v2.TransactionMessage
-	(*TransactionConfig)(nil),                  // 13: jetstream.v2.TransactionConfig
-	(*CompiledInstruction)(nil),                // 14: jetstream.v2.CompiledInstruction
-	(*MessageAddressTableLookup)(nil),          // 15: jetstream.v2.MessageAddressTableLookup
-	(*SubscribeSlotsRequest)(nil),              // 16: jetstream.v2.SubscribeSlotsRequest
-	(*SlotEvent)(nil),                          // 17: jetstream.v2.SlotEvent
-	(*PingRequest)(nil),                        // 18: jetstream.v2.PingRequest
-	(*PongResponse)(nil),                       // 19: jetstream.v2.PongResponse
-	(*GetVersionRequest)(nil),                  // 20: jetstream.v2.GetVersionRequest
-	(*GetVersionResponse)(nil),                 // 21: jetstream.v2.GetVersionResponse
-	(*timestamppb.Timestamp)(nil),              // 22: google.protobuf.Timestamp
+	(BlockFooterSignatureKind)(0),              // 1: jetstream.v2.BlockFooterSignatureKind
+	(*SubscribeTransactionsRequest)(nil),       // 2: jetstream.v2.SubscribeTransactionsRequest
+	(*Ping)(nil),                               // 3: jetstream.v2.Ping
+	(*AddFilters)(nil),                         // 4: jetstream.v2.AddFilters
+	(*TxFilter)(nil),                           // 5: jetstream.v2.TxFilter
+	(*SubscribeRequestFilterTransactions)(nil), // 6: jetstream.v2.SubscribeRequestFilterTransactions
+	(*RemoveFilters)(nil),                      // 7: jetstream.v2.RemoveFilters
+	(*SubscribeTransactionsResponse)(nil),      // 8: jetstream.v2.SubscribeTransactionsResponse
+	(*Pong)(nil),                               // 9: jetstream.v2.Pong
+	(*FilterResult)(nil),                       // 10: jetstream.v2.FilterResult
+	(*Heartbeat)(nil),                          // 11: jetstream.v2.Heartbeat
+	(*FilteredTransaction)(nil),                // 12: jetstream.v2.FilteredTransaction
+	(*TransactionMessage)(nil),                 // 13: jetstream.v2.TransactionMessage
+	(*TransactionConfig)(nil),                  // 14: jetstream.v2.TransactionConfig
+	(*CompiledInstruction)(nil),                // 15: jetstream.v2.CompiledInstruction
+	(*MessageAddressTableLookup)(nil),          // 16: jetstream.v2.MessageAddressTableLookup
+	(*SubscribeSlotsRequest)(nil),              // 17: jetstream.v2.SubscribeSlotsRequest
+	(*SlotEvent)(nil),                          // 18: jetstream.v2.SlotEvent
+	(*BlockFooter)(nil),                        // 19: jetstream.v2.BlockFooter
+	(*BlockFooterVotesAggregate)(nil),          // 20: jetstream.v2.BlockFooterVotesAggregate
+	(*BlockFooterFinalCert)(nil),               // 21: jetstream.v2.BlockFooterFinalCert
+	(*BlockFooterSkipRewardCert)(nil),          // 22: jetstream.v2.BlockFooterSkipRewardCert
+	(*BlockFooterNotarRewardCert)(nil),         // 23: jetstream.v2.BlockFooterNotarRewardCert
+	(*PingRequest)(nil),                        // 24: jetstream.v2.PingRequest
+	(*PongResponse)(nil),                       // 25: jetstream.v2.PongResponse
+	(*GetVersionRequest)(nil),                  // 26: jetstream.v2.GetVersionRequest
+	(*GetVersionResponse)(nil),                 // 27: jetstream.v2.GetVersionResponse
+	(*timestamppb.Timestamp)(nil),              // 28: google.protobuf.Timestamp
 }
 var file_jetstream_v2_proto_depIdxs = []int32{
-	2,  // 0: jetstream.v2.SubscribeTransactionsRequest.ping:type_name -> jetstream.v2.Ping
-	3,  // 1: jetstream.v2.SubscribeTransactionsRequest.add_filters:type_name -> jetstream.v2.AddFilters
-	6,  // 2: jetstream.v2.SubscribeTransactionsRequest.remove_filters:type_name -> jetstream.v2.RemoveFilters
-	4,  // 3: jetstream.v2.AddFilters.filters:type_name -> jetstream.v2.TxFilter
-	5,  // 4: jetstream.v2.TxFilter.filter:type_name -> jetstream.v2.SubscribeRequestFilterTransactions
-	22, // 5: jetstream.v2.SubscribeTransactionsResponse.created_at:type_name -> google.protobuf.Timestamp
-	11, // 6: jetstream.v2.SubscribeTransactionsResponse.transaction:type_name -> jetstream.v2.FilteredTransaction
-	8,  // 7: jetstream.v2.SubscribeTransactionsResponse.pong:type_name -> jetstream.v2.Pong
-	9,  // 8: jetstream.v2.SubscribeTransactionsResponse.filter_validation:type_name -> jetstream.v2.FilterResult
-	10, // 9: jetstream.v2.SubscribeTransactionsResponse.heartbeat:type_name -> jetstream.v2.Heartbeat
-	12, // 10: jetstream.v2.FilteredTransaction.transaction:type_name -> jetstream.v2.TransactionMessage
-	14, // 11: jetstream.v2.TransactionMessage.instructions:type_name -> jetstream.v2.CompiledInstruction
-	15, // 12: jetstream.v2.TransactionMessage.address_table_lookups:type_name -> jetstream.v2.MessageAddressTableLookup
-	13, // 13: jetstream.v2.TransactionMessage.config:type_name -> jetstream.v2.TransactionConfig
+	3,  // 0: jetstream.v2.SubscribeTransactionsRequest.ping:type_name -> jetstream.v2.Ping
+	4,  // 1: jetstream.v2.SubscribeTransactionsRequest.add_filters:type_name -> jetstream.v2.AddFilters
+	7,  // 2: jetstream.v2.SubscribeTransactionsRequest.remove_filters:type_name -> jetstream.v2.RemoveFilters
+	5,  // 3: jetstream.v2.AddFilters.filters:type_name -> jetstream.v2.TxFilter
+	6,  // 4: jetstream.v2.TxFilter.filter:type_name -> jetstream.v2.SubscribeRequestFilterTransactions
+	28, // 5: jetstream.v2.SubscribeTransactionsResponse.created_at:type_name -> google.protobuf.Timestamp
+	12, // 6: jetstream.v2.SubscribeTransactionsResponse.transaction:type_name -> jetstream.v2.FilteredTransaction
+	9,  // 7: jetstream.v2.SubscribeTransactionsResponse.pong:type_name -> jetstream.v2.Pong
+	10, // 8: jetstream.v2.SubscribeTransactionsResponse.filter_validation:type_name -> jetstream.v2.FilterResult
+	11, // 9: jetstream.v2.SubscribeTransactionsResponse.heartbeat:type_name -> jetstream.v2.Heartbeat
+	13, // 10: jetstream.v2.FilteredTransaction.transaction:type_name -> jetstream.v2.TransactionMessage
+	15, // 11: jetstream.v2.TransactionMessage.instructions:type_name -> jetstream.v2.CompiledInstruction
+	16, // 12: jetstream.v2.TransactionMessage.address_table_lookups:type_name -> jetstream.v2.MessageAddressTableLookup
+	14, // 13: jetstream.v2.TransactionMessage.config:type_name -> jetstream.v2.TransactionConfig
 	0,  // 14: jetstream.v2.SlotEvent.status:type_name -> jetstream.v2.SlotStatus
-	1,  // 15: jetstream.v2.JetstreamV2.SubscribeTransactions:input_type -> jetstream.v2.SubscribeTransactionsRequest
-	16, // 16: jetstream.v2.JetstreamV2.SubscribeSlots:input_type -> jetstream.v2.SubscribeSlotsRequest
-	18, // 17: jetstream.v2.JetstreamV2.Ping:input_type -> jetstream.v2.PingRequest
-	20, // 18: jetstream.v2.JetstreamV2.GetVersion:input_type -> jetstream.v2.GetVersionRequest
-	7,  // 19: jetstream.v2.JetstreamV2.SubscribeTransactions:output_type -> jetstream.v2.SubscribeTransactionsResponse
-	17, // 20: jetstream.v2.JetstreamV2.SubscribeSlots:output_type -> jetstream.v2.SlotEvent
-	19, // 21: jetstream.v2.JetstreamV2.Ping:output_type -> jetstream.v2.PongResponse
-	21, // 22: jetstream.v2.JetstreamV2.GetVersion:output_type -> jetstream.v2.GetVersionResponse
-	19, // [19:23] is the sub-list for method output_type
-	15, // [15:19] is the sub-list for method input_type
-	15, // [15:15] is the sub-list for extension type_name
-	15, // [15:15] is the sub-list for extension extendee
-	0,  // [0:15] is the sub-list for field type_name
+	19, // 15: jetstream.v2.SlotEvent.block_footer:type_name -> jetstream.v2.BlockFooter
+	21, // 16: jetstream.v2.BlockFooter.block_final_cert:type_name -> jetstream.v2.BlockFooterFinalCert
+	22, // 17: jetstream.v2.BlockFooter.skip_reward_cert:type_name -> jetstream.v2.BlockFooterSkipRewardCert
+	23, // 18: jetstream.v2.BlockFooter.notar_reward_cert:type_name -> jetstream.v2.BlockFooterNotarRewardCert
+	1,  // 19: jetstream.v2.BlockFooterVotesAggregate.signature_kind:type_name -> jetstream.v2.BlockFooterSignatureKind
+	20, // 20: jetstream.v2.BlockFooterFinalCert.final_aggregate:type_name -> jetstream.v2.BlockFooterVotesAggregate
+	20, // 21: jetstream.v2.BlockFooterFinalCert.notar_aggregate:type_name -> jetstream.v2.BlockFooterVotesAggregate
+	20, // 22: jetstream.v2.BlockFooterSkipRewardCert.aggregate:type_name -> jetstream.v2.BlockFooterVotesAggregate
+	20, // 23: jetstream.v2.BlockFooterNotarRewardCert.aggregate:type_name -> jetstream.v2.BlockFooterVotesAggregate
+	2,  // 24: jetstream.v2.JetstreamV2.SubscribeTransactions:input_type -> jetstream.v2.SubscribeTransactionsRequest
+	17, // 25: jetstream.v2.JetstreamV2.SubscribeSlots:input_type -> jetstream.v2.SubscribeSlotsRequest
+	24, // 26: jetstream.v2.JetstreamV2.Ping:input_type -> jetstream.v2.PingRequest
+	26, // 27: jetstream.v2.JetstreamV2.GetVersion:input_type -> jetstream.v2.GetVersionRequest
+	8,  // 28: jetstream.v2.JetstreamV2.SubscribeTransactions:output_type -> jetstream.v2.SubscribeTransactionsResponse
+	18, // 29: jetstream.v2.JetstreamV2.SubscribeSlots:output_type -> jetstream.v2.SlotEvent
+	25, // 30: jetstream.v2.JetstreamV2.Ping:output_type -> jetstream.v2.PongResponse
+	27, // 31: jetstream.v2.JetstreamV2.GetVersion:output_type -> jetstream.v2.GetVersionResponse
+	28, // [28:32] is the sub-list for method output_type
+	24, // [24:28] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_jetstream_v2_proto_init() }
@@ -1713,15 +2236,13 @@ func file_jetstream_v2_proto_init() {
 		(*SubscribeTransactionsResponse_FilterValidation)(nil),
 		(*SubscribeTransactionsResponse_Heartbeat)(nil),
 	}
-	file_jetstream_v2_proto_msgTypes[11].OneofWrappers = []any{}
-	file_jetstream_v2_proto_msgTypes[12].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_jetstream_v2_proto_rawDesc), len(file_jetstream_v2_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   21,
+			NumEnums:      2,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

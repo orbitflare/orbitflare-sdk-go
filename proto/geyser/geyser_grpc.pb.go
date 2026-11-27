@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Geyser_Subscribe_FullMethodName           = "/geyser.Geyser/Subscribe"
 	Geyser_SubscribeDeshred_FullMethodName    = "/geyser.Geyser/SubscribeDeshred"
+	Geyser_SubscribeGossip_FullMethodName     = "/geyser.Geyser/SubscribeGossip"
 	Geyser_SubscribeReplayInfo_FullMethodName = "/geyser.Geyser/SubscribeReplayInfo"
 	Geyser_Ping_FullMethodName                = "/geyser.Geyser/Ping"
 	Geyser_GetLatestBlockhash_FullMethodName  = "/geyser.Geyser/GetLatestBlockhash"
@@ -36,6 +37,7 @@ const (
 type GeyserClient interface {
 	Subscribe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeRequest, SubscribeUpdate], error)
 	SubscribeDeshred(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubscribeDeshredRequest, SubscribeUpdateDeshred], error)
+	SubscribeGossip(ctx context.Context, in *SubscribeGossipRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubscribeUpdateGossip], error)
 	SubscribeReplayInfo(ctx context.Context, in *SubscribeReplayInfoRequest, opts ...grpc.CallOption) (*SubscribeReplayInfoResponse, error)
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PongResponse, error)
 	GetLatestBlockhash(ctx context.Context, in *GetLatestBlockhashRequest, opts ...grpc.CallOption) (*GetLatestBlockhashResponse, error)
@@ -78,6 +80,25 @@ func (c *geyserClient) SubscribeDeshred(ctx context.Context, opts ...grpc.CallOp
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Geyser_SubscribeDeshredClient = grpc.BidiStreamingClient[SubscribeDeshredRequest, SubscribeUpdateDeshred]
+
+func (c *geyserClient) SubscribeGossip(ctx context.Context, in *SubscribeGossipRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubscribeUpdateGossip], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Geyser_ServiceDesc.Streams[2], Geyser_SubscribeGossip_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SubscribeGossipRequest, SubscribeUpdateGossip]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Geyser_SubscribeGossipClient = grpc.ServerStreamingClient[SubscribeUpdateGossip]
 
 func (c *geyserClient) SubscribeReplayInfo(ctx context.Context, in *SubscribeReplayInfoRequest, opts ...grpc.CallOption) (*SubscribeReplayInfoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -155,6 +176,7 @@ func (c *geyserClient) GetVersion(ctx context.Context, in *GetVersionRequest, op
 type GeyserServer interface {
 	Subscribe(grpc.BidiStreamingServer[SubscribeRequest, SubscribeUpdate]) error
 	SubscribeDeshred(grpc.BidiStreamingServer[SubscribeDeshredRequest, SubscribeUpdateDeshred]) error
+	SubscribeGossip(*SubscribeGossipRequest, grpc.ServerStreamingServer[SubscribeUpdateGossip]) error
 	SubscribeReplayInfo(context.Context, *SubscribeReplayInfoRequest) (*SubscribeReplayInfoResponse, error)
 	Ping(context.Context, *PingRequest) (*PongResponse, error)
 	GetLatestBlockhash(context.Context, *GetLatestBlockhashRequest) (*GetLatestBlockhashResponse, error)
@@ -177,6 +199,9 @@ func (UnimplementedGeyserServer) Subscribe(grpc.BidiStreamingServer[SubscribeReq
 }
 func (UnimplementedGeyserServer) SubscribeDeshred(grpc.BidiStreamingServer[SubscribeDeshredRequest, SubscribeUpdateDeshred]) error {
 	return status.Error(codes.Unimplemented, "method SubscribeDeshred not implemented")
+}
+func (UnimplementedGeyserServer) SubscribeGossip(*SubscribeGossipRequest, grpc.ServerStreamingServer[SubscribeUpdateGossip]) error {
+	return status.Error(codes.Unimplemented, "method SubscribeGossip not implemented")
 }
 func (UnimplementedGeyserServer) SubscribeReplayInfo(context.Context, *SubscribeReplayInfoRequest) (*SubscribeReplayInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubscribeReplayInfo not implemented")
@@ -233,6 +258,17 @@ func _Geyser_SubscribeDeshred_Handler(srv interface{}, stream grpc.ServerStream)
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Geyser_SubscribeDeshredServer = grpc.BidiStreamingServer[SubscribeDeshredRequest, SubscribeUpdateDeshred]
+
+func _Geyser_SubscribeGossip_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeGossipRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GeyserServer).SubscribeGossip(m, &grpc.GenericServerStream[SubscribeGossipRequest, SubscribeUpdateGossip]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Geyser_SubscribeGossipServer = grpc.ServerStreamingServer[SubscribeUpdateGossip]
 
 func _Geyser_SubscribeReplayInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SubscribeReplayInfoRequest)
@@ -408,6 +444,11 @@ var Geyser_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _Geyser_SubscribeDeshred_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
+		},
+		{
+			StreamName:    "SubscribeGossip",
+			Handler:       _Geyser_SubscribeGossip_Handler,
+			ServerStreams: true,
 		},
 	},
 	Metadata: "geyser.proto",

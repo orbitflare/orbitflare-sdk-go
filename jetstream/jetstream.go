@@ -7,8 +7,7 @@ import (
 	"log/slog"
 	"time"
 
-	"google.golang.org/grpc"
-
+	"github.com/orbitflare/orbitflare-sdk-go/internal/events"
 	"github.com/orbitflare/orbitflare-sdk-go/internal/streaming"
 	"github.com/orbitflare/orbitflare-sdk-go/orbitflare"
 	pb "github.com/orbitflare/orbitflare-sdk-go/proto/jetstream"
@@ -81,6 +80,7 @@ func (c *Client) Close() { c.cancel() }
 
 type Stream struct {
 	ch     <-chan streaming.Result[*pb.SubscribeUpdate]
+	hub    *events.Hub
 	cancel context.CancelFunc
 }
 
@@ -96,29 +96,37 @@ func (s *Stream) Next(ctx context.Context) (*pb.SubscribeUpdate, error) {
 	}
 }
 
+func (s *Stream) Events() *orbitflare.ConnectionEvents { return s.hub.Subscribe() }
+
 func (s *Stream) Close() { s.cancel() }
 
 func (c *Client) Subscribe(request *pb.SubscribeRequest) *Stream {
 	ctx, cancel := context.WithCancel(c.ctx)
 	ch := make(chan streaming.Result[*pb.SubscribeUpdate], c.cfg.ChannelCapacity)
 
-	go streaming.RunStream(ctx, c.cfg, "jetstream", ch,
-		func(rctx context.Context, conn *grpc.ClientConn, onConnected func()) error {
-			return runConnection(rctx, conn, request, onConnected, ch, c.cfg)
+	hub := events.NewHub()
+
+	go streaming.RunStream(ctx, c.cfg, "jetstream", ch, hub,
+		func(rctx context.Context, conn *streaming.Conn) error {
+			return runConnection(rctx, conn, request, ch, c.cfg)
 		})
 
-	return &Stream{ch: ch, cancel: cancel}
+	return &Stream{ch: ch, hub: hub, cancel: cancel}
 }
 
-func runConnection(ctx context.Context, conn *grpc.ClientConn, request *pb.SubscribeRequest, onConnected func(), out chan<- streaming.Result[*pb.SubscribeUpdate], cfg *streaming.Config) error {
-	stream, err := pb.NewJetstreamClient(conn).Subscribe(ctx)
+func runConnection(ctx context.Context, conn *streaming.Conn, request *pb.SubscribeRequest, out chan<- streaming.Result[*pb.SubscribeUpdate], cfg *streaming.Config) error {
+	stream, err := pb.NewJetstreamClient(conn.ClientConn).Subscribe(ctx)
 	if err != nil {
-		return orbitflare.NewTransportError(err)
+		return streaming.RecvError(err)
 	}
 	if err := stream.Send(request); err != nil {
-		return &orbitflare.StreamError{Message: "outbound closed"}
+		_, rerr := stream.Recv()
+		return streaming.RecvError(rerr)
 	}
-	onConnected()
+	if err := streaming.Header(stream, func() error { _, err := stream.Recv(); return err }); err != nil {
+		return err
+	}
+	conn.Connected()
 
 	msgCh := make(chan *pb.SubscribeUpdate, 64)
 	errCh := make(chan error, 1)
@@ -156,8 +164,9 @@ func runConnection(ctx context.Context, conn *grpc.ClientConn, request *pb.Subsc
 			return streaming.RecvError(err)
 
 		case update := <-msgCh:
+			missed = 0
+			conn.Message()
 			if update.GetPong() != nil {
-				missed = 0
 				continue
 			}
 			select {
@@ -197,6 +206,7 @@ func (b *Builder) Keepalive(d time.Duration) *Builder      { b.cfg.Keepalive(d);
 func (b *Builder) PingInterval(d time.Duration) *Builder   { b.cfg.PingInterval(d); return b }
 func (b *Builder) MaxMissedPongs(n uint32) *Builder        { b.cfg.MaxMissedPongs(n); return b }
 func (b *Builder) ChannelCapacity(n int) *Builder          { b.cfg.ChannelCapacity(n); return b }
+func (b *Builder) MaxDecodingMessageSize(n int) *Builder   { b.cfg.MaxDecodingMessageSize(n); return b }
 func (b *Builder) Logger(l *slog.Logger) *Builder          { b.cfg.Logger(l); return b }
 
 func (b *Builder) Build() (*Client, error) {

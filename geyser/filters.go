@@ -261,6 +261,21 @@ func (f *BlockFilter) toProto() *pb.SubscribeRequestFilterBlocks {
 	}
 }
 
+type BlockFooterFilter struct {
+	includeCertificates *bool
+}
+
+func NewBlockFooterFilter() *BlockFooterFilter { return &BlockFooterFilter{} }
+
+func (f *BlockFooterFilter) IncludeCertificates(v bool) *BlockFooterFilter {
+	f.includeCertificates = &v
+	return f
+}
+
+func (f *BlockFooterFilter) toProto() *pb.SubscribeRequestFilterBlockFooter {
+	return &pb.SubscribeRequestFilterBlockFooter{IncludeCertificates: f.includeCertificates}
+}
+
 type DeshredTransactionFilter struct {
 	vote            *bool
 	accountInclude  []string
@@ -304,6 +319,7 @@ type SubscribeRequestBuilder struct {
 	blocks             map[string]*BlockFilter
 	blocksMeta         []string
 	entry              []string
+	blockFooter        map[string]*BlockFooterFilter
 	commitment         *Commitment
 	accountsDataSlice  [][2]uint64
 	fromSlot           *uint64
@@ -316,6 +332,7 @@ func NewSubscribeRequestBuilder() *SubscribeRequestBuilder {
 		transactions:       map[string]*TransactionFilter{},
 		transactionsStatus: map[string]*TransactionFilter{},
 		blocks:             map[string]*BlockFilter{},
+		blockFooter:        map[string]*BlockFooterFilter{},
 	}
 }
 
@@ -351,6 +368,11 @@ func (b *SubscribeRequestBuilder) BlocksMeta(name string) *SubscribeRequestBuild
 
 func (b *SubscribeRequestBuilder) Entry(name string) *SubscribeRequestBuilder {
 	b.entry = append(b.entry, name)
+	return b
+}
+
+func (b *SubscribeRequestBuilder) BlockFooter(name string, filter *BlockFooterFilter) *SubscribeRequestBuilder {
+	b.blockFooter[name] = filter
 	return b
 }
 
@@ -398,6 +420,10 @@ func (b *SubscribeRequestBuilder) Build() *pb.SubscribeRequest {
 	for _, k := range b.entry {
 		entry[k] = &pb.SubscribeRequestFilterEntry{}
 	}
+	blockFooter := make(map[string]*pb.SubscribeRequestFilterBlockFooter, len(b.blockFooter))
+	for k, v := range b.blockFooter {
+		blockFooter[k] = v.toProto()
+	}
 	dataSlice := make([]*pb.SubscribeRequestAccountsDataSlice, 0, len(b.accountsDataSlice))
 	for _, s := range b.accountsDataSlice {
 		dataSlice = append(dataSlice, &pb.SubscribeRequestAccountsDataSlice{Offset: s[0], Length: s[1]})
@@ -413,6 +439,7 @@ func (b *SubscribeRequestBuilder) Build() *pb.SubscribeRequest {
 		Entry:              entry,
 		AccountsDataSlice:  dataSlice,
 		FromSlot:           b.fromSlot,
+		BlockFooter:        blockFooter,
 	}
 	if b.commitment != nil {
 		c := pb.CommitmentLevel(*b.commitment)

@@ -20,6 +20,7 @@ type ConfigBuilder struct {
 	pingInterval    time.Duration
 	maxMissedPongs  uint32
 	channelCapacity int
+	maxDecoding     int
 	logger          *slog.Logger
 }
 
@@ -31,6 +32,7 @@ func NewConfigBuilder() *ConfigBuilder {
 		pingInterval:    DefaultPingInterval,
 		maxMissedPongs:  DefaultMaxMissedPongs,
 		channelCapacity: DefaultChannelCapacity,
+		maxDecoding:     DefaultMaxDecodingMessageSize,
 	}
 }
 
@@ -53,6 +55,7 @@ func (b *ConfigBuilder) Keepalive(d time.Duration)      { b.keepalive = d }
 func (b *ConfigBuilder) PingInterval(d time.Duration)   { b.pingInterval = d }
 func (b *ConfigBuilder) MaxMissedPongs(n uint32)        { b.maxMissedPongs = n }
 func (b *ConfigBuilder) ChannelCapacity(n int)          { b.channelCapacity = n }
+func (b *ConfigBuilder) MaxDecodingMessageSize(n int)   { b.maxDecoding = n }
 func (b *ConfigBuilder) Logger(l *slog.Logger)          { b.logger = l }
 
 func (b *ConfigBuilder) Build(envVar string) (*Config, error) {
@@ -70,14 +73,15 @@ func (b *ConfigBuilder) Build(envVar string) (*Config, error) {
 	}
 
 	return &Config{
-		Endpoints:       endpoint.New(url, b.fallbacks),
-		APIKey:          apiKey,
-		Retry:           b.retry,
-		Timeout:         b.timeout,
-		Keepalive:       b.keepalive,
-		PingInterval:    b.pingInterval,
-		MaxMissedPongs:  b.maxMissedPongs,
-		ChannelCapacity: b.channelCapacity,
-		Logger:          orbitflare.ResolveLogger(b.logger),
+		Endpoints:              endpoint.New(url, b.fallbacks),
+		APIKey:                 apiKey,
+		Retry:                  b.retry,
+		Timeout:                b.timeout,
+		Keepalive:              b.keepalive,
+		PingInterval:           b.pingInterval,
+		MaxMissedPongs:         b.maxMissedPongs,
+		ChannelCapacity:        b.channelCapacity,
+		MaxDecodingMessageSize: b.maxDecoding,
+		Logger:                 orbitflare.ResolveLogger(b.logger),
 	}, nil
 }
